@@ -1,5 +1,5 @@
-import { Hello } from '../src';
+import { AthenaQueryResultParser } from '../src';
 
 test('hello', () => {
-  expect(new Hello().sayHello()).toBe('hello, world!');
+  expect(new AthenaQueryResultParser()).toBeInstanceOf(AthenaQueryResultParser);
 });
