@@ -10,14 +10,15 @@ const project = new typescript.TypeScriptProject({
   deps: [
     '@aws-sdk/client-athena@^3.983.0',
   ],
-  releaseToNpm: false,
+  releaseToNpm: true,
+  npmTrustedPublishing: true,
   npmAccess: javascript.NpmAccess.PUBLIC,
   minNodeVersion: '20.0.0',
   workflowNodeVersion: '24.x',
   depsUpgradeOptions: {
     workflowOptions: {
       labels: ['auto-approve', 'auto-merge'],
-      // schedule: javascript.UpgradeDependenciesSchedule.expressions(['15 16 * * 5']),
+      schedule: javascript.UpgradeDependenciesSchedule.WEEKDAY,
     },
   },
   githubOptions: {
