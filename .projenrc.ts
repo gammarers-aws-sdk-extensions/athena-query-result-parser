@@ -18,7 +18,7 @@ const project = new typescript.TypeScriptProject({
   depsUpgradeOptions: {
     workflowOptions: {
       labels: ['auto-approve', 'auto-merge'],
-      schedule: javascript.UpgradeDependenciesSchedule.WEEKDAY,
+      schedule: javascript.UpgradeDependenciesSchedule.WEEKLY,
     },
   },
   githubOptions: {
