@@ -9,6 +9,14 @@ export type ParsedRow = Record<string, string | null>;
  * Type for a custom row parser that converts ParsedRow to T (or null to skip).
  */
 export type RowParser<T> = (row: ParsedRow) => T | null;
+export type SkipHeaderRowOption = 'auto' | boolean;
+
+/**
+ * Parse options for ResultSet parsing.
+ */
+export type ParseResultSetOptions = {
+  skipHeaderRow?: SkipHeaderRowOption;
+};
 
 /**
  * AthenaQueryResultParser
@@ -75,11 +83,15 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Parse rows from a ResultSet (skips header row automatically, once per parser instance).
+   * Parse rows from a ResultSet.
    * @param resultSet - Athena ResultSet
+   * @param options - Parse options (skipHeaderRow: 'auto' | true | false)
    * @returns Array of parsed row objects
    */
-  parseResultSet(resultSet: ResultSet | undefined): ParsedRow[] {
+  parseResultSet(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParsedRow[] {
     if (!resultSet) {
       return [];
     }
@@ -93,11 +105,16 @@ export class AthenaQueryResultParser {
     }
 
     const rawRows = resultSet.Rows ?? [];
+    const skipHeaderRow = options.skipHeaderRow ?? 'auto';
     const skipHeader =
-      !this.headerRowDropped &&
-      rawRows.length > 0 &&
-      AthenaQueryResultParser.isHeaderRow(rawRows[0], this.headers);
-    if (skipHeader) {
+      skipHeaderRow === true
+        ? rawRows.length > 0
+        : skipHeaderRow === false
+          ? false
+          : !this.headerRowDropped &&
+            rawRows.length > 0 &&
+            AthenaQueryResultParser.isHeaderRow(rawRows[0], this.headers);
+    if (skipHeaderRow === 'auto' && skipHeader) {
       this.headerRowDropped = true;
     }
     const rows = skipHeader ? rawRows.slice(1) : rawRows;
@@ -116,8 +133,9 @@ export class AthenaQueryResultParser {
   parseResultSetWith<T>(
     resultSet: ResultSet | undefined,
     rowParser: RowParser<T>,
+    options: ParseResultSetOptions = {},
   ): T[] {
-    const rows = this.parseResultSet(resultSet);
+    const rows = this.parseResultSet(resultSet, options);
     const results: T[] = [];
 
     for (const row of rows) {
