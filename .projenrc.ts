@@ -36,4 +36,7 @@ const project = new typescript.TypeScriptProject({
     ],
   },
 });
+// package ignore .devcontainer directory
+project.addPackageIgnore('/.devcontainer');
+
 project.synth();
