@@ -18,10 +18,21 @@ export type RowParser<T> = (row: ParsedRow) => T | null;
  * Controls whether the first row should be skipped as a header row.
  *
  * - `'auto'`: skips only when the first row's cells match the headers
- * - `true`: always skips the first row (when present)
+ * - `true`: skips the first row only when it looks like a header row (see also
+ *   {@link ParseResultSetOptions.forcedSkipHeaderRowMismatchBehavior})
  * - `false`: never skips the first row
  */
 export type SkipHeaderRowOption = 'auto' | boolean;
+
+/**
+ * Controls what happens when `skipHeaderRow: true` is specified but the first
+ * row does not look like a header row.
+ *
+ * - `'throw'` (default): throw to prevent accidental data loss
+ * - `'keep'`: keep the first row
+ * - `'skip'`: skip the first row anyway (potentially lossy)
+ */
+export type ForcedSkipHeaderRowMismatchBehavior = 'throw' | 'skip' | 'keep';
 
 /**
  * Behavior when the column names returned by Athena contain duplicates.
@@ -47,7 +58,10 @@ export type HeaderRowDecision =
   | {
     mode: 'forced';
     skipped: boolean;
-    reason: 'skipHeaderRow:true';
+    reason:
+      | 'skipFirstRow:true'
+      | 'skipHeaderRow:true'
+      | 'skipHeaderRow:true:not-header-row';
   }
   | {
     mode: 'disabled';
@@ -75,11 +89,25 @@ type AutoHeaderRowReason = AutoHeaderRowDecision['reason'];
  */
 export type ParseResultSetOptions = {
   /**
+   * Whether to drop the first row unconditionally.
+   *
+   * Use this when you truly want to skip the first row regardless of its
+   * contents (explicit, potentially lossy).
+   */
+  skipFirstRow?: boolean;
+  /**
    * Whether to drop the header row.
    *
    * Default: `'auto'`.
    */
   skipHeaderRow?: SkipHeaderRowOption;
+  /**
+   * Controls what happens when `skipHeaderRow: true` is used but the first row
+   * does not look like a header row.
+   *
+   * Default: `'throw'`.
+   */
+  forcedSkipHeaderRowMismatchBehavior?: ForcedSkipHeaderRowMismatchBehavior;
   /**
    * Behavior when {@link ColumnInfo.Name} contains duplicates.
    *
@@ -400,53 +428,96 @@ export class AthenaQueryResultParser {
     }
 
     const rawRows = resultSet.Rows ?? [];
+    const skipFirstRow = options.skipFirstRow ?? false;
     const skipHeaderRow = options.skipHeaderRow ?? 'auto';
     const strategy = options.headerRowDetectionStrategy ?? 'exact';
+    const mismatchBehavior = options.forcedSkipHeaderRowMismatchBehavior ?? 'throw';
 
     let decision: HeaderRowDecision;
-    if (skipHeaderRow === true) {
+    if (skipFirstRow) {
       const skipped = rawRows.length > 0;
-      decision = {
-        mode: 'forced',
-        skipped,
-        reason: 'skipHeaderRow:true',
-      };
+      decision = { mode: 'forced', skipped, reason: 'skipFirstRow:true' };
       if (skipped) this.headerRowDropped = true;
-    } else if (skipHeaderRow === false) {
-      decision = {
-        mode: 'disabled',
-        skipped: false,
-        reason: 'skipHeaderRow:false',
-      };
-    } else if (rawRows.length === 0) {
-      decision = {
-        mode: 'auto',
-        skipped: false,
-        strategy,
-        reason: 'no-rows',
-      };
-    } else if (this.headerRowDropped) {
-      decision = {
-        mode: 'auto',
-        skipped: false,
-        strategy,
-        reason: 'already-dropped',
-      };
     } else {
-      const auto = AthenaQueryResultParser.shouldAutoSkipHeaderRow({
-        firstRow: rawRows[0],
-        headers: this.headers,
-        columnInfo: meta,
-        strategy,
-      });
-      const skipped = auto.skip;
-      decision = {
-        mode: 'auto',
-        skipped,
-        strategy,
-        reason: auto.reason,
-      };
-      if (skipped) this.headerRowDropped = true;
+      if (skipHeaderRow === true) {
+        if (rawRows.length === 0) {
+          decision = { mode: 'forced', skipped: false, reason: 'skipHeaderRow:true' };
+        } else {
+          const looksLikeHeader = AthenaQueryResultParser.isHeaderRow(
+            rawRows[0],
+            this.headers,
+          );
+          if (!looksLikeHeader) {
+            if (mismatchBehavior === 'throw') {
+              throw new Error(
+                'skipHeaderRow:true was specified but the first row does not look like a header row. ' +
+                'If you want to always drop the first row, use skipFirstRow:true. ' +
+                'Or set forcedSkipHeaderRowMismatchBehavior to "skip" or "keep".',
+              );
+            }
+
+            if (mismatchBehavior === 'keep') {
+              decision = {
+                mode: 'forced',
+                skipped: false,
+                reason: 'skipHeaderRow:true:not-header-row',
+              };
+            } else {
+            // mismatchBehavior === 'skip'
+              decision = {
+                mode: 'forced',
+                skipped: true,
+                reason: 'skipHeaderRow:true:not-header-row',
+              };
+              this.headerRowDropped = true;
+            }
+          } else {
+            decision = { mode: 'forced', skipped: true, reason: 'skipHeaderRow:true' };
+            this.headerRowDropped = true;
+          }
+        }
+      } else {
+        if (skipHeaderRow === false) {
+          decision = {
+            mode: 'disabled',
+            skipped: false,
+            reason: 'skipHeaderRow:false',
+          };
+        } else {
+          if (rawRows.length === 0) {
+            decision = {
+              mode: 'auto',
+              skipped: false,
+              strategy,
+              reason: 'no-rows',
+            };
+          } else {
+            if (this.headerRowDropped) {
+              decision = {
+                mode: 'auto',
+                skipped: false,
+                strategy,
+                reason: 'already-dropped',
+              };
+            } else {
+              const auto = AthenaQueryResultParser.shouldAutoSkipHeaderRow({
+                firstRow: rawRows[0],
+                headers: this.headers,
+                columnInfo: meta,
+                strategy,
+              });
+              const skipped = auto.skip;
+              decision = {
+                mode: 'auto',
+                skipped,
+                strategy,
+                reason: auto.reason,
+              };
+              if (skipped) this.headerRowDropped = true;
+            }
+          }
+        }
+      }
     }
 
     this.lastHeaderRowDecision = decision;
