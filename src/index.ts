@@ -1,43 +1,79 @@
 import type { Row, ColumnInfo, ResultSet } from '@aws-sdk/client-athena';
 
 /**
- * Type for a parsed row (key = column name, value = string or null).
+ * A parsed Athena row represented as an object.
+ *
+ * The key is the column name and the value is a string (or null when missing).
  */
 export type ParsedRow = Record<string, string | null>;
 
 /**
- * Type for a custom row parser that converts ParsedRow to T (or null to skip).
+ * A custom row parser that converts a {@link ParsedRow} to `T`.
+ *
+ * Returning `null` means "skip this row".
  */
 export type RowParser<T> = (row: ParsedRow) => T | null;
+
+/**
+ * Controls whether the first row should be skipped as a header row.
+ *
+ * - `'auto'`: skips only when the first row's cells match the headers
+ * - `true`: always skips the first row (when present)
+ * - `false`: never skips the first row
+ */
 export type SkipHeaderRowOption = 'auto' | boolean;
 
 /**
- * Parse options for ResultSet parsing.
+ * Behavior when the column names returned by Athena contain duplicates.
+ */
+export type DuplicateColumnNameBehavior = 'throw' | 'suffix' | 'allow';
+
+/**
+ * Options for parsing an Athena {@link ResultSet}.
  */
 export type ParseResultSetOptions = {
+  /**
+   * Whether to drop the header row.
+   *
+   * Default: `'auto'`.
+   */
   skipHeaderRow?: SkipHeaderRowOption;
+  /**
+   * Behavior when {@link ColumnInfo.Name} contains duplicates.
+   *
+   * - `'throw'` (default): throw an Error listing duplicates
+   * - `'suffix'`: rename duplicates like `col`, `col_2`, `col_3`, ...
+   * - `'allow'`: keep duplicates (later columns overwrite earlier ones in {@link rowToObject})
+   */
+  duplicateColumnNames?: DuplicateColumnNameBehavior;
 };
 
 /**
- * AthenaQueryResultParser
- * Parses Athena query result ResultSet into header-based row objects.
+ * Parses Athena query results into header-based row objects.
  */
 export class AthenaQueryResultParser {
 
   /**
-   * Build header array from ResultSetMetadata.
-   * @param columnInfo - ColumnInfo array from Athena ResultSetMetadata
-   * @returns Header string array
+   * Builds a header array from Athena `ResultSetMetadata`.
+   *
+   * When a column name is missing, it falls back to `col_<index>`.
+   *
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
    */
-  static headersFromMeta(columnInfo: ColumnInfo[]): string[] {
-    return columnInfo.map((col, index) => col?.Name ?? `col_${index}`);
+  static headersFromMeta(
+    columnInfo: ColumnInfo[],
+    options: { duplicateColumnNames?: DuplicateColumnNameBehavior } = {},
+  ): string[] {
+    const headers = columnInfo.map((col, index) => col?.Name ?? `col_${index}`);
+    const behavior = options.duplicateColumnNames ?? 'throw';
+    return AthenaQueryResultParser.resolveDuplicateHeaders(headers, behavior);
   }
 
   /**
-   * Convert an Athena Row into a key-value object using headers.
-   * @param row - Athena Row
-   * @param headers - Header array
-   * @returns Parsed row object
+   * Converts an Athena `Row` into a key-value object using the provided headers.
+   *
+   * If headers contain duplicates, later values overwrite earlier ones.
    */
   static rowToObject(row: Row, headers: string[]): ParsedRow {
     const obj: ParsedRow = {};
@@ -48,10 +84,7 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Check if the row is the header row (all cells match headers).
-   * @param row - Athena Row
-   * @param headers - Header array
-   * @returns true if the row is the header row
+   * Returns whether the given row is a header row (all cells match headers).
    */
   static isHeaderRow(row: Row, headers: string[]): boolean {
     if (!row?.Data?.length) return false;
@@ -60,33 +93,101 @@ export class AthenaQueryResultParser {
     );
   }
 
+  private static resolveDuplicateHeaders(
+    headers: string[],
+    behavior: DuplicateColumnNameBehavior,
+  ): string[] {
+    if (behavior === 'allow') {
+      return headers;
+    }
+
+    const counts = new Map<string, number>();
+    for (const header of headers) {
+      counts.set(header, (counts.get(header) ?? 0) + 1);
+    }
+    const duplicates = [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([name]) => name);
+
+    if (duplicates.length === 0) {
+      return headers;
+    }
+
+    if (behavior === 'throw') {
+      throw new Error(
+        `Duplicate column names detected: ${duplicates.join(', ')}`,
+      );
+    }
+
+    // behavior === 'suffix'
+    const nextIndexByName = new Map<string, number>();
+    const resolved: string[] = [];
+    for (const header of headers) {
+      const next = nextIndexByName.get(header) ?? 1;
+      if (next === 1) {
+        resolved.push(header);
+        nextIndexByName.set(header, 2);
+        continue;
+      }
+
+      let candidate = `${header}_${next}`;
+      let candidateIndex = next;
+      while (counts.has(candidate)) {
+        candidateIndex += 1;
+        candidate = `${header}_${candidateIndex}`;
+      }
+      resolved.push(candidate);
+      nextIndexByName.set(header, candidateIndex + 1);
+      counts.set(candidate, 1);
+    }
+
+    return resolved;
+  }
+
   private headers: string[] | null = null;
   private headerRowDropped = false;
+  private duplicateColumnNames: DuplicateColumnNameBehavior = 'throw';
 
   constructor() {}
 
   /**
-   * Initialize headers from column metadata (idempotent; only sets when not already set).
-   * @param columnInfo - ColumnInfo array
+   * Initializes headers from column metadata.
+   *
+   * This method is idempotent: headers are set only when not already initialized.
+   *
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
    */
-  initHeaders(columnInfo: ColumnInfo[]): void {
+  initHeaders(
+    columnInfo: ColumnInfo[],
+    options: { duplicateColumnNames?: DuplicateColumnNameBehavior } = {},
+  ): void {
     if (!this.headers && columnInfo.length > 0) {
-      this.headers = AthenaQueryResultParser.headersFromMeta(columnInfo);
+      const behavior = options.duplicateColumnNames ?? this.duplicateColumnNames;
+      this.duplicateColumnNames = behavior;
+      this.headers = AthenaQueryResultParser.headersFromMeta(columnInfo, {
+        duplicateColumnNames: behavior,
+      });
     }
   }
 
   /**
-   * Get the current headers (null until initHeaders/parseResultSet is called).
+   * Returns the current headers.
+   *
+   * Returns `null` until {@link initHeaders} / {@link parseResultSet} has been called.
    */
   getHeaders(): string[] | null {
     return this.headers;
   }
 
   /**
-   * Parse rows from a ResultSet.
-   * @param resultSet - Athena ResultSet
-   * @param options - Parse options (skipHeaderRow: 'auto' | true | false)
-   * @returns Array of parsed row objects
+   * Parses rows from an Athena {@link ResultSet}.
+   *
+   * By default, this method auto-detects and skips the first row when it matches
+   * the headers.
+   *
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
    */
   parseResultSet(
     resultSet: ResultSet | undefined,
@@ -98,7 +199,7 @@ export class AthenaQueryResultParser {
 
     // Initialize headers from metadata
     const meta = resultSet.ResultSetMetadata?.ColumnInfo ?? [];
-    this.initHeaders(meta);
+    this.initHeaders(meta, { duplicateColumnNames: options.duplicateColumnNames });
 
     if (!this.headers) {
       return [];
@@ -125,10 +226,9 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Parse ResultSet and transform each row with a custom parser (null results are filtered out).
-   * @param resultSet - Athena ResultSet
-   * @param rowParser - Custom row parser
-   * @returns Array of parsed results (nulls filtered out)
+   * Parses a {@link ResultSet} and maps each parsed row through a custom parser.
+   *
+   * Any `null` results returned from `rowParser` are filtered out.
    */
   parseResultSetWith<T>(
     resultSet: ResultSet | undefined,
@@ -149,7 +249,9 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Reset parser state (headers and header-row-dropped flag). Use when reusing for a new query.
+   * Resets the parser state (headers and header-row-dropped flag).
+   *
+   * Call this when reusing a parser instance for a new query.
    */
   reset(): void {
     this.headers = null;
@@ -157,5 +259,7 @@ export class AthenaQueryResultParser {
   }
 }
 
-// Re-export static methods for convenience
+/**
+ * Re-export static methods for convenience.
+ */
 export const { headersFromMeta, rowToObject, isHeaderRow } = AthenaQueryResultParser;
