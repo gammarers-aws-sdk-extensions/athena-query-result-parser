@@ -29,6 +29,48 @@ export type SkipHeaderRowOption = 'auto' | boolean;
 export type DuplicateColumnNameBehavior = 'throw' | 'suffix' | 'allow';
 
 /**
+ * Strategy used when auto-detecting a header row.
+ *
+ * - `'exact'`: treat the first row as a header row when all cells exactly match the headers (legacy)
+ * - `'safe'`: only skip when the first row matches headers AND at least one column's type makes it
+ *   very unlikely to be a data row (helps avoid false positives)
+ */
+export type HeaderRowDetectionStrategy = 'exact' | 'safe';
+
+/**
+ * Describes whether and why a header row was skipped.
+ *
+ * When {@link ParseResultSetOptions.skipHeaderRow} is `'auto'`, this decision is
+ * derived from {@link HeaderRowDetectionStrategy} and the incoming `ResultSet`.
+ */
+export type HeaderRowDecision =
+  | {
+    mode: 'forced';
+    skipped: boolean;
+    reason: 'skipHeaderRow:true';
+  }
+  | {
+    mode: 'disabled';
+    skipped: false;
+    reason: 'skipHeaderRow:false';
+  }
+  | {
+    mode: 'auto';
+    skipped: boolean;
+    strategy: HeaderRowDetectionStrategy;
+    reason:
+        | 'no-rows'
+        | 'already-dropped'
+        | 'not-header-row'
+        | 'exact-match'
+        | 'safe:type-evidence'
+        | 'safe:no-type-evidence';
+  };
+
+type AutoHeaderRowDecision = Extract<HeaderRowDecision, { mode: 'auto' }>;
+type AutoHeaderRowReason = AutoHeaderRowDecision['reason'];
+
+/**
  * Options for parsing an Athena {@link ResultSet}.
  */
 export type ParseResultSetOptions = {
@@ -46,6 +88,15 @@ export type ParseResultSetOptions = {
    * - `'allow'`: keep duplicates (later columns overwrite earlier ones in {@link rowToObject})
    */
   duplicateColumnNames?: DuplicateColumnNameBehavior;
+  /**
+   * Controls how header-row auto detection behaves.
+   *
+   * Default: `'exact'` (legacy behavior).
+   *
+   * Consider using `'safe'` to reduce false positives where the first data row
+   * happens to equal the headers.
+   */
+  headerRowDetectionStrategy?: HeaderRowDetectionStrategy;
 };
 
 /**
@@ -91,6 +142,138 @@ export class AthenaQueryResultParser {
     return headers.every(
       (header, index) => (row.Data?.[index]?.VarCharValue ?? null) === header,
     );
+  }
+
+  /**
+   * Returns a normalized Athena type string used for comparisons.
+   */
+  private static normalizeType(type: string | undefined): string {
+    return (type ?? '').trim().toLowerCase();
+  }
+
+  /**
+   * Returns whether the Athena type is treated as a "string-like" type.
+   */
+  private static isStringLikeType(type: string | undefined): boolean {
+    const t = AthenaQueryResultParser.normalizeType(type);
+    return (
+      t === 'string' ||
+      t.startsWith('varchar') ||
+      t.startsWith('char') ||
+      t.startsWith('varbinary')
+    );
+  }
+
+  /**
+   * Returns whether the Athena type is treated as a "numeric-like" type.
+   */
+  private static isNumericLikeType(type: string | undefined): boolean {
+    const t = AthenaQueryResultParser.normalizeType(type);
+    return (
+      t === 'tinyint' ||
+      t === 'smallint' ||
+      t === 'int' ||
+      t === 'integer' ||
+      t === 'bigint' ||
+      t === 'real' ||
+      t === 'float' ||
+      t === 'double' ||
+      t.startsWith('decimal')
+    );
+  }
+
+  /**
+   * Returns whether the Athena type is treated as a boolean type.
+   */
+  private static isBooleanLikeType(type: string | undefined): boolean {
+    const t = AthenaQueryResultParser.normalizeType(type);
+    return t === 'boolean';
+  }
+
+  /**
+   * Returns whether the Athena type is treated as a date/time-like type.
+   */
+  private static isDateTimeLikeType(type: string | undefined): boolean {
+    const t = AthenaQueryResultParser.normalizeType(type);
+    return (
+      t === 'date' ||
+      t === 'timestamp' ||
+      t.startsWith('timestamp ') ||
+      t === 'time' ||
+      t.startsWith('time ')
+    );
+  }
+
+  /**
+   * Returns whether a string value looks parseable for the given Athena type.
+   *
+   * This is used only for the `'safe'` header-row detection strategy to decide
+   * whether a header-looking row is unlikely to be valid data.
+   */
+  private static isParseableAsType(value: string, type: string | undefined): boolean {
+    const t = AthenaQueryResultParser.normalizeType(type);
+    if (AthenaQueryResultParser.isNumericLikeType(t)) {
+      return Number.isFinite(Number(value));
+    }
+    if (AthenaQueryResultParser.isBooleanLikeType(t)) {
+      return value === 'true' || value === 'false';
+    }
+    if (AthenaQueryResultParser.isDateTimeLikeType(t)) {
+      // Athena typically returns ISO-like strings for date/time types.
+      // We keep this intentionally strict to avoid classifying column names as data.
+      return !Number.isNaN(Date.parse(value));
+    }
+    // For complex/string-like types, assume parseable.
+    return true;
+  }
+
+  /**
+   * Implements the header-row auto detection logic.
+   *
+   * - `'exact'`: skip when the first row exactly matches headers (legacy)
+   * - `'safe'`: require type-based evidence that the row is not valid data
+   */
+  private static shouldAutoSkipHeaderRow(params: {
+    firstRow: Row;
+    headers: string[];
+    columnInfo: ColumnInfo[];
+    strategy: HeaderRowDetectionStrategy;
+  }): { skip: boolean; reason: AutoHeaderRowReason } {
+    const { firstRow, headers, columnInfo, strategy } = params;
+    const isExact = AthenaQueryResultParser.isHeaderRow(firstRow, headers);
+    if (!isExact) {
+      return { skip: false, reason: 'not-header-row' };
+    }
+
+    if (strategy === 'exact') {
+      return { skip: true, reason: 'exact-match' };
+    }
+
+    // strategy === 'safe'
+    // Only skip when there is type-based evidence that this row is not a valid data row.
+    // This reduces the chance of accidentally dropping a real data row that happens to
+    // equal the headers.
+    let hasNonStringColumn = false;
+    let hasEvidence = false;
+
+    for (const [index, header] of headers.entries()) {
+      const type = columnInfo[index]?.Type;
+      if (!AthenaQueryResultParser.isStringLikeType(type)) {
+        hasNonStringColumn = true;
+        if (!AthenaQueryResultParser.isParseableAsType(header, type)) {
+          hasEvidence = true;
+          break;
+        }
+      }
+    }
+
+    if (!hasNonStringColumn) {
+      return { skip: false, reason: 'safe:no-type-evidence' };
+    }
+
+    return hasEvidence
+      ? { skip: true, reason: 'safe:type-evidence' }
+      : { skip: false, reason: 'safe:no-type-evidence' };
   }
 
   private static resolveDuplicateHeaders(
@@ -147,6 +330,7 @@ export class AthenaQueryResultParser {
   private headers: string[] | null = null;
   private headerRowDropped = false;
   private duplicateColumnNames: DuplicateColumnNameBehavior = 'throw';
+  private lastHeaderRowDecision: HeaderRowDecision | null = null;
 
   constructor() {}
 
@@ -181,6 +365,16 @@ export class AthenaQueryResultParser {
   }
 
   /**
+   * Returns information about the most recent header-row decision.
+   *
+   * This is useful when `skipHeaderRow` is `'auto'` and you need to know whether
+   * the first row was skipped (and why).
+   */
+  getLastHeaderRowDecision(): HeaderRowDecision | null {
+    return this.lastHeaderRowDecision;
+  }
+
+  /**
    * Parses rows from an Athena {@link ResultSet}.
    *
    * By default, this method auto-detects and skips the first row when it matches
@@ -207,17 +401,56 @@ export class AthenaQueryResultParser {
 
     const rawRows = resultSet.Rows ?? [];
     const skipHeaderRow = options.skipHeaderRow ?? 'auto';
-    const skipHeader =
-      skipHeaderRow === true
-        ? rawRows.length > 0
-        : skipHeaderRow === false
-          ? false
-          : !this.headerRowDropped &&
-            rawRows.length > 0 &&
-            AthenaQueryResultParser.isHeaderRow(rawRows[0], this.headers);
-    if (skipHeaderRow === 'auto' && skipHeader) {
-      this.headerRowDropped = true;
+    const strategy = options.headerRowDetectionStrategy ?? 'exact';
+
+    let decision: HeaderRowDecision;
+    if (skipHeaderRow === true) {
+      const skipped = rawRows.length > 0;
+      decision = {
+        mode: 'forced',
+        skipped,
+        reason: 'skipHeaderRow:true',
+      };
+      if (skipped) this.headerRowDropped = true;
+    } else if (skipHeaderRow === false) {
+      decision = {
+        mode: 'disabled',
+        skipped: false,
+        reason: 'skipHeaderRow:false',
+      };
+    } else if (rawRows.length === 0) {
+      decision = {
+        mode: 'auto',
+        skipped: false,
+        strategy,
+        reason: 'no-rows',
+      };
+    } else if (this.headerRowDropped) {
+      decision = {
+        mode: 'auto',
+        skipped: false,
+        strategy,
+        reason: 'already-dropped',
+      };
+    } else {
+      const auto = AthenaQueryResultParser.shouldAutoSkipHeaderRow({
+        firstRow: rawRows[0],
+        headers: this.headers,
+        columnInfo: meta,
+        strategy,
+      });
+      const skipped = auto.skip;
+      decision = {
+        mode: 'auto',
+        skipped,
+        strategy,
+        reason: auto.reason,
+      };
+      if (skipped) this.headerRowDropped = true;
     }
+
+    this.lastHeaderRowDecision = decision;
+    const skipHeader = decision.skipped;
     const rows = skipHeader ? rawRows.slice(1) : rawRows;
 
     return rows.map((row) =>
@@ -256,6 +489,7 @@ export class AthenaQueryResultParser {
   reset(): void {
     this.headers = null;
     this.headerRowDropped = false;
+    this.lastHeaderRowDecision = null;
   }
 }
 
