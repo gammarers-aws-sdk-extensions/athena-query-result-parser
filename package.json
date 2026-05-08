@@ -1,5 +1,6 @@
 {
   "name": "athena-query-result-parser",
+  "description": "A small TypeScript library that parses Amazon Athena query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It handles metadata-driven headers, skips the header row when present, and supports custom row transformers.",
   "repository": {
     "type": "git",
     "url": "https://github.com/gammarers-aws-sdk-extensions/athena-query-result-parser.git"
@@ -52,6 +53,13 @@
   },
   "engines": {
     "node": ">= 20.0.0"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "yarn",
+      "version": "1.22.22",
+      "onFail": "ignore"
+    }
   },
   "main": "lib/index.js",
   "license": "Apache-2.0",
