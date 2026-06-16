@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/athena-query-result-parser.svg)](https://www.npmjs.com/package/athena-query-result-parser)
 [![license](https://img.shields.io/npm/l/athena-query-result-parser.svg)](https://www.npmjs.com/package/athena-query-result-parser)
 
-A small TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/) query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It handles metadata-driven headers, skips the header row when present, and supports custom row transformers.
+A small TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/) query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It handles metadata-driven headers, skips the header row when present, supports configurable column-count mismatch handling, and supports custom row transformers.
 
 ## Features
 
@@ -11,6 +11,9 @@ A small TypeScript library that parses [Amazon Athena](https://aws.amazon.com/at
 - **Header row handling**: `skipHeaderRow` option lets callers choose `'auto' | true | false` (`'auto'` by default).
 - **Robust header auto-detection**: `headerRowDetectionStrategy` option helps reduce false positives when using `skipHeaderRow: 'auto'`.
 - **Duplicate column name handling**: `duplicateColumnNames` option lets callers choose how to handle duplicate `ColumnInfo.Name` values (`'throw' | 'suffix' | 'allow'`).
+- **Column-count mismatch handling**: `columnCountMismatchBehavior` option controls what happens when `row.Data` length differs from the header count (`'silent' | 'throw' | 'warn' | 'extra'`).
+- **Value conversion helpers**: `toNumber`, `toBoolean`, and `toDate` provide safe conversions for `string | null` values.
+- **Type-aware row conversion**: `rowToTypedObject` can convert cell values based on `ColumnInfo.Type` (e.g. `bigint` → `number`, `boolean` → `boolean`, `timestamp` → `Date`).
 - **Static helpers**: `headersFromMeta`, `rowToObject`, and `isHeaderRow` are exported for use without a parser instance.
 - **Custom row parsing**: `parseResultSetWith<T>()` lets you transform each row with a custom function; rows that return `null` are filtered out.
 - **Reusable parser**: Call `reset()` to clear state when reusing the parser for a new query.
@@ -55,6 +58,63 @@ const rows = parser.parseResultSet(resultSet, {
 
 const decision = parser.getLastHeaderRowDecision();
 // decision tells you whether the first row was skipped and why
+```
+
+### Strict column-count validation
+
+By default, rows shorter than the header count are padded with `null`, and surplus cells are discarded. Use `'throw'` to fail fast instead of silently losing data:
+
+```typescript
+const rows = parser.parseResultSet(resultSet, {
+  columnCountMismatchBehavior: 'throw',
+});
+```
+
+### Preserving surplus columns
+
+When a row has more cells than headers, store the extra values under `__extra`:
+
+```typescript
+import { EXTRA_COLUMNS_KEY } from 'athena-query-result-parser';
+
+const rows = parser.parseResultSet(resultSet, {
+  columnCountMismatchBehavior: 'extra',
+  skipHeaderRow: false,
+});
+// e.g. { id: '1', name: 'Alice', __extra: ['surplus1', 'surplus2'] }
+// or access via rows[0][EXTRA_COLUMNS_KEY]
+```
+
+### Safe value conversion helpers
+
+When you parse rows as `string | null`, you can use safe conversion helpers to avoid ad-hoc parsing:
+
+```typescript
+import { toNumber, toBoolean, toDate } from 'athena-query-result-parser';
+
+const n = toNumber(row.count);        // number | null
+const b = toBoolean(row.is_active);   // boolean | null
+const d = toDate(row.created_at);     // Date | null
+```
+
+### Type-aware row conversion (ColumnInfo.Type based)
+
+If you have `ColumnInfo` available, you can convert a single row using the column types:
+
+```typescript
+import { rowToTypedObject } from 'athena-query-result-parser';
+import type { ColumnInfo, Row } from '@aws-sdk/client-athena';
+
+const typed = rowToTypedObject(row, headers, columnInfo);
+// typed: Record<string, string | number | boolean | Date | null>
+```
+
+By default, unparseable values are kept as strings. To convert unparseable values to `null`:
+
+```typescript
+const typed = rowToTypedObject(row, headers, columnInfo, {
+  unparseableValueBehavior: 'null',
+});
 ```
 
 ### Custom row parser
@@ -147,6 +207,26 @@ parser.parseResultSet(resultSet, { duplicateColumnNames: 'allow' });
 parser.parseResultSetWith(resultSet, rowParser, { duplicateColumnNames: 'suffix' });
 ```
 
+### `columnCountMismatchBehavior`
+
+Control what happens when a row's `Data` array length does not match the header count.
+
+- `'silent'` (default): Pad missing cells with `null` and discard surplus cells (legacy behavior).
+- `'throw'`: Throw an error (strict mode) to prevent silent data loss.
+- `'warn'`: Emit `console.warn` but keep the `'silent'` value mapping.
+- `'extra'`: Store surplus cells under `__extra` (`EXTRA_COLUMNS_KEY`); short rows are still padded with `null`.
+
+```typescript
+parser.parseResultSet(resultSet); // default: { columnCountMismatchBehavior: 'silent' }
+parser.parseResultSet(resultSet, { columnCountMismatchBehavior: 'throw' });
+parser.parseResultSet(resultSet, { columnCountMismatchBehavior: 'warn' });
+parser.parseResultSet(resultSet, { columnCountMismatchBehavior: 'extra' });
+
+// rowToObject also accepts this option directly
+import { rowToObject } from 'athena-query-result-parser';
+rowToObject(row, headers, { columnCountMismatchBehavior: 'throw', rowIndex: 0 });
+```
+
 ### `headerRowDetectionStrategy`
 
 Controls how header-row auto detection behaves when `skipHeaderRow` is `'auto'`.
@@ -178,12 +258,21 @@ You can use the static functions without creating a parser:
 import {
   headersFromMeta,
   rowToObject,
+  rowToTypedObject,
   isHeaderRow,
+  EXTRA_COLUMNS_KEY,
+  toNumber,
+  toBoolean,
+  toDate,
 } from 'athena-query-result-parser';
 import type { ColumnInfo, Row } from '@aws-sdk/client-athena';
 
 const headers = headersFromMeta(columnInfo);           // string[]
 const obj = rowToObject(row, headers);                 // ParsedRow
+const objStrict = rowToObject(row, headers, {
+  columnCountMismatchBehavior: 'throw',
+});
+const typed = rowToTypedObject(row, headers, columnInfo);
 const isHeader = isHeaderRow(row, headers);            // boolean
 ```
 
@@ -191,8 +280,12 @@ const isHeader = isHeaderRow(row, headers);            // boolean
 
 ### Types
 
-- **`ParsedRow`**: `Record<string, string | null>` — one parsed row (column name → value or `null`).
+- **`ParsedRow`**: `Record<string, string | null>` with an optional `__extra` field — one parsed row (column name → value or `null`). When `columnCountMismatchBehavior` is `'extra'`, surplus cell values are stored in `__extra` as `(string | null)[]`.
+- **`TypedParsedRow`**: `Record<string, string | number | boolean | Date | null>` with an optional `__extra` field — a row converted based on `ColumnInfo.Type`.
 - **`RowParser<T>`**: `(row: ParsedRow) => T | null` — custom row transformer; return `null` to exclude the row.
+- **`ColumnCountMismatchBehavior`**: `'silent' | 'throw' | 'warn' | 'extra'`.
+- **`EXTRA_COLUMNS_KEY`**: `'__extra'` — well-known key for surplus cell values.
+- **`toNumber` / `toBoolean` / `toDate`**: Safe conversion helpers for `string | null` values.
 
 ### Class: `AthenaQueryResultParser`
 
@@ -201,15 +294,16 @@ const isHeader = isHeaderRow(row, headers);            // boolean
 | `initHeaders(columnInfo)` | Set headers from `ColumnInfo` (no-op if already set). |
 | `getHeaders()` | Current headers or `null` until initialized. |
 | `getLastHeaderRowDecision()` | Last header-row decision (useful when `skipHeaderRow` is `'auto'`). |
-| `parseResultSet(resultSet, options?)` | Parse rows from a `ResultSet`; returns `ParsedRow[]`. `options.skipHeaderRow` supports `'auto' | true | false`. |
+| `parseResultSet(resultSet, options?)` | Parse rows from a `ResultSet`; returns `ParsedRow[]`. |
 | `parseResultSetWith<T>(resultSet, rowParser, options?)` | Parse and transform with `rowParser`; returns `T[]` (nulls filtered out). `options` is forwarded to `parseResultSet`. |
 | `reset()` | Clear headers and internal state for reuse. |
 
 ### Static methods (also exported as standalone)
 
-- **`headersFromMeta(columnInfo)`**: Build header array from `ColumnInfo`; missing names become `col_0`, `col_1`, …
-- **`rowToObject(row, headers)`**: Convert one `Row` to a `ParsedRow` using the given headers.
-- **`isHeaderRow(row, headers)`**: Return `true` if the row’s cells match the headers.
+- **`headersFromMeta(columnInfo, options?)`**: Build header array from `ColumnInfo`; missing names become `col_0`, `col_1`, …
+- **`rowToObject(row, headers, options?)`**: Convert one `Row` to a `ParsedRow` using the given headers. Supports `columnCountMismatchBehavior` and `rowIndex` in `options`.
+- **`rowToTypedObject(row, headers, columnInfo, options?)`**: Convert one `Row` to a `TypedParsedRow` using `ColumnInfo.Type`.
+- **`isHeaderRow(row, headers)`**: Return `true` if the row's cells match the headers (compares only the first `headers.length` cells).
 
 ## Requirements
 
@@ -219,4 +313,4 @@ const isHeader = isHeaderRow(row, headers);            // boolean
 
 ## License
 
-This project is licensed under the (Apache-2.0) License.
+This project is licensed under the Apache-2.0 License.

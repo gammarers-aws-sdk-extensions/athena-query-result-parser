@@ -1,11 +1,79 @@
 import type { Row, ColumnInfo, ResultSet } from '@aws-sdk/client-athena';
 
 /**
+ * Well-known key on {@link ParsedRow} that holds surplus cell values when
+ * `columnCountMismatchBehavior` is `'extra'`.
+ */
+export const EXTRA_COLUMNS_KEY = '__extra' as const;
+
+/**
  * A parsed Athena row represented as an object.
  *
  * The key is the column name and the value is a string (or null when missing).
+ *
+ * When {@link ColumnCountMismatchBehavior} is `'extra'` and a row has more cells
+ * than headers, surplus values are stored under {@link EXTRA_COLUMNS_KEY}.
  */
-export type ParsedRow = Record<string, string | null>;
+export type ParsedRow = Record<string, string | null> & {
+  [EXTRA_COLUMNS_KEY]?: (string | null)[];
+};
+
+/**
+ * A parsed Athena cell value that has been converted based on the column type.
+ */
+export type AthenaTypedValue = string | number | boolean | Date | null;
+
+/**
+ * A parsed Athena row represented as an object with values converted based on
+ * {@link ColumnInfo.Type}.
+ *
+ * When {@link ColumnCountMismatchBehavior} is `'extra'` and a row has more cells
+ * than headers, surplus values are stored under {@link EXTRA_COLUMNS_KEY}.
+ */
+export type TypedParsedRow = Record<string, AthenaTypedValue> & {
+  [EXTRA_COLUMNS_KEY]?: (string | null)[];
+};
+
+/**
+ * Safely converts a string value to a finite number.
+ *
+ * Returns `null` when the value is `null`, empty/whitespace, or not a finite number.
+ */
+export const toNumber = (value: string | null): number | null => {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Safely converts a string value to a boolean.
+ *
+ * Accepts (case-insensitive) `'true'` and `'false'`.
+ * Returns `null` for `null`, empty/whitespace, or unrecognized values.
+ */
+export const toBoolean = (value: string | null): boolean | null => {
+  if (value == null) return null;
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed.length === 0) return null;
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  return null;
+};
+
+/**
+ * Safely converts a string value to a {@link Date}.
+ *
+ * Uses {@link Date.parse} and returns `null` when parsing fails.
+ */
+export const toDate = (value: string | null): Date | null => {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isNaN(ms) ? null : new Date(ms);
+};
 
 /**
  * A custom row parser that converts a {@link ParsedRow} to `T`.
@@ -36,8 +104,55 @@ export type ForcedSkipHeaderRowMismatchBehavior = 'throw' | 'skip' | 'keep';
 
 /**
  * Behavior when the column names returned by Athena contain duplicates.
+ *
+ * - `'throw'` (default): throw an Error listing duplicate names
+ * - `'suffix'`: rename duplicates like `col`, `col_2`, `col_3`, ...
+ * - `'allow'`: keep duplicates (later columns overwrite earlier ones in
+ *   {@link AthenaQueryResultParser.rowToObject})
  */
 export type DuplicateColumnNameBehavior = 'throw' | 'suffix' | 'allow';
+
+/**
+ * Behavior when `row.Data` length does not match the number of headers.
+ *
+ * - `'silent'` (default): pad missing cells with `null` and discard surplus cells
+ * - `'throw'`: throw an Error (strict mode) to prevent silent data loss
+ * - `'warn'`: emit `console.warn` but keep the `'silent'` value mapping
+ * - `'extra'`: store surplus cells under {@link EXTRA_COLUMNS_KEY}; short rows are
+ *   still padded with `null` (use `'throw'` or `'warn'` to detect them)
+ */
+export type ColumnCountMismatchBehavior = 'silent' | 'throw' | 'warn' | 'extra';
+
+/**
+ * Options for {@link AthenaQueryResultParser.rowToObject}.
+ */
+export type RowToObjectOptions = {
+  /**
+   * How to handle rows whose `Data` length differs from `headers.length`.
+   *
+   * Default: `'silent'`.
+   *
+   * @see ColumnCountMismatchBehavior
+   */
+  columnCountMismatchBehavior?: ColumnCountMismatchBehavior;
+  /**
+   * Zero-based row index included in throw/warn messages when available.
+   */
+  rowIndex?: number;
+};
+
+/**
+ * Options for {@link AthenaQueryResultParser.rowToTypedObject}.
+ */
+export type RowToTypedObjectOptions = RowToObjectOptions & {
+  /**
+   * How to handle values that cannot be converted based on the column type.
+   *
+   * - `'keep'` (default): keep the original string value
+   * - `'null'`: replace with `null`
+   */
+  unparseableValueBehavior?: 'keep' | 'null';
+};
 
 /**
  * Strategy used when auto-detecting a header row.
@@ -50,6 +165,9 @@ export type HeaderRowDetectionStrategy = 'exact' | 'safe';
 
 /**
  * Describes whether and why a header row was skipped.
+ *
+ * Inspect via {@link AthenaQueryResultParser.getLastHeaderRowDecision} after
+ * {@link AthenaQueryResultParser.parseResultSet}.
  *
  * When {@link ParseResultSetOptions.skipHeaderRow} is `'auto'`, this decision is
  * derived from {@link HeaderRowDetectionStrategy} and the incoming `ResultSet`.
@@ -113,7 +231,8 @@ export type ParseResultSetOptions = {
    *
    * - `'throw'` (default): throw an Error listing duplicates
    * - `'suffix'`: rename duplicates like `col`, `col_2`, `col_3`, ...
-   * - `'allow'`: keep duplicates (later columns overwrite earlier ones in {@link rowToObject})
+   * - `'allow'`: keep duplicates (later columns overwrite earlier ones in
+   *   {@link AthenaQueryResultParser.rowToObject})
    */
   duplicateColumnNames?: DuplicateColumnNameBehavior;
   /**
@@ -125,10 +244,21 @@ export type ParseResultSetOptions = {
    * happens to equal the headers.
    */
   headerRowDetectionStrategy?: HeaderRowDetectionStrategy;
+  /**
+   * Behavior when a row's `Data` array length does not match the header count.
+   *
+   * Default: `'silent'` (legacy behavior).
+   *
+   * @see ColumnCountMismatchBehavior
+   */
+  columnCountMismatchBehavior?: ColumnCountMismatchBehavior;
 };
 
 /**
  * Parses Athena query results into header-based row objects.
+ *
+ * Handles metadata-driven headers, optional header-row skipping, duplicate
+ * column-name resolution, and configurable row/column-count mismatch behavior.
  */
 export class AthenaQueryResultParser {
 
@@ -137,6 +267,9 @@ export class AthenaQueryResultParser {
    *
    * When a column name is missing, it falls back to `col_<index>`.
    *
+   * @param columnInfo - Column metadata from the Athena `ResultSet`.
+   * @param options - Parser options (for example, duplicate column-name handling).
+   * @returns Resolved header names in column order.
    * @throws Error When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
    */
@@ -153,17 +286,119 @@ export class AthenaQueryResultParser {
    * Converts an Athena `Row` into a key-value object using the provided headers.
    *
    * If headers contain duplicates, later values overwrite earlier ones.
+   *
+   * When `row.Data` is shorter than `headers`, missing cells become `null`.
+   * When it is longer, surplus cells are discarded unless
+   * `columnCountMismatchBehavior` is `'extra'` (stored under
+   * {@link EXTRA_COLUMNS_KEY}).
+   *
+   * @param row - A single Athena result row.
+   * @param headers - Header names derived from metadata (or otherwise).
+   * @param options - Row conversion options (for example, column-count mismatch behavior).
+   * @returns A {@link ParsedRow} keyed by header name.
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and
+   * `row.Data.length` does not equal `headers.length`.
    */
-  static rowToObject(row: Row, headers: string[]): ParsedRow {
+  static rowToObject(
+    row: Row,
+    headers: string[],
+    options: RowToObjectOptions = {},
+  ): ParsedRow {
+    const behavior = options.columnCountMismatchBehavior ?? 'silent';
+    const expected = headers.length;
+    const actual = AthenaQueryResultParser.getRowDataLength(row);
+
+    AthenaQueryResultParser.handleColumnCountMismatch(
+      expected,
+      actual,
+      behavior,
+      options.rowIndex,
+    );
+
     const obj: ParsedRow = {};
     for (const [index, header] of headers.entries()) {
       obj[header] = row.Data?.[index]?.VarCharValue ?? null;
     }
+
+    if (behavior === 'extra' && actual > expected) {
+      const extras: (string | null)[] = [];
+      for (let index = expected; index < actual; index += 1) {
+        extras.push(row.Data?.[index]?.VarCharValue ?? null);
+      }
+      obj[EXTRA_COLUMNS_KEY] = extras;
+    }
+
+    return obj;
+  }
+
+  /**
+   * Converts an Athena `Row` into a key-value object using the provided headers
+   * and column metadata.
+   *
+   * Values are converted based on {@link ColumnInfo.Type}:
+   *
+   * - numeric-like types (e.g. `bigint`, `double`, `decimal(...)`) → `number`
+   * - `boolean` → `boolean`
+   * - date/time-like types (`date`, `timestamp`, `time`) → `Date`
+   * - other/complex types → `string`
+   *
+   * Conversion is conservative: when a value cannot be parsed for its type, it
+   * is kept as a `string` by default.
+   *
+   * @param row - A single Athena result row.
+   * @param headers - Header names derived from metadata (or otherwise).
+   * @param columnInfo - Column metadata in the same order as `headers`.
+   * @param options - Row conversion options.
+   * @returns A {@link TypedParsedRow} keyed by header name.
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and
+   * `row.Data.length` does not equal `headers.length`.
+   */
+  static rowToTypedObject(
+    row: Row,
+    headers: string[],
+    columnInfo: ColumnInfo[],
+    options: RowToTypedObjectOptions = {},
+  ): TypedParsedRow {
+    const behavior = options.columnCountMismatchBehavior ?? 'silent';
+    const expected = headers.length;
+    const actual = AthenaQueryResultParser.getRowDataLength(row);
+
+    AthenaQueryResultParser.handleColumnCountMismatch(
+      expected,
+      actual,
+      behavior,
+      options.rowIndex,
+    );
+
+    const unparseable = options.unparseableValueBehavior ?? 'keep';
+    const obj: TypedParsedRow = {};
+
+    for (const [index, header] of headers.entries()) {
+      const raw = row.Data?.[index]?.VarCharValue ?? null;
+      const type = columnInfo[index]?.Type;
+      obj[header] = AthenaQueryResultParser.convertTypedValue(raw, type, unparseable);
+    }
+
+    if (behavior === 'extra' && actual > expected) {
+      const extras: (string | null)[] = [];
+      for (let index = expected; index < actual; index += 1) {
+        extras.push(row.Data?.[index]?.VarCharValue ?? null);
+      }
+      obj[EXTRA_COLUMNS_KEY] = extras;
+    }
+
     return obj;
   }
 
   /**
    * Returns whether the given row is a header row (all cells match headers).
+   *
+   * Compares only the first `headers.length` cells; surplus cells in `row.Data`
+   * are ignored. Rows shorter than `headers` never match.
+   *
+   * @param row - A single Athena result row.
+   * @param headers - Header names to compare against.
+   * @returns `true` when every header cell equals the corresponding header name.
    */
   static isHeaderRow(row: Row, headers: string[]): boolean {
     if (!row?.Data?.length) return false;
@@ -173,7 +408,93 @@ export class AthenaQueryResultParser {
   }
 
   /**
+   * Returns the number of cells in `row.Data`, or `0` when `Data` is absent.
+   */
+  private static getRowDataLength(row: Row): number {
+    return row.Data?.length ?? 0;
+  }
+
+  private static convertTypedValue(
+    value: string | null,
+    type: string | undefined,
+    unparseable: 'keep' | 'null',
+  ): AthenaTypedValue {
+    if (value == null) return null;
+
+    const t = AthenaQueryResultParser.normalizeType(type);
+    if (AthenaQueryResultParser.isNumericLikeType(t)) {
+      const n = toNumber(value);
+      if (n != null) return n;
+      return unparseable === 'null' ? null : value;
+    }
+
+    if (AthenaQueryResultParser.isBooleanLikeType(t)) {
+      const b = toBoolean(value);
+      if (b != null) return b;
+      return unparseable === 'null' ? null : value;
+    }
+
+    if (AthenaQueryResultParser.isDateTimeLikeType(t)) {
+      const d = toDate(value);
+      if (d != null) return d;
+      return unparseable === 'null' ? null : value;
+    }
+
+    return value;
+  }
+
+  /**
+   * Builds a human-readable message for a row/header column-count mismatch.
+   *
+   * @param expected - Expected column count (typically `headers.length`).
+   * @param actual - Actual `row.Data` length.
+   * @param rowIndex - Optional zero-based row index for context.
+   */
+  private static describeColumnCountMismatch(
+    expected: number,
+    actual: number,
+    rowIndex?: number,
+  ): string {
+    const rowPart = rowIndex != null ? ` at row index ${rowIndex}` : '';
+    return `Column count mismatch${rowPart}: expected ${expected} column(s) but row has ${actual}`;
+  }
+
+  /**
+   * Applies {@link ColumnCountMismatchBehavior} when counts differ.
+   *
+   * No-op for `'silent'` and `'extra'` (callers handle `'extra'` mapping).
+   *
+   * @throws Error When `behavior` is `'throw'`.
+   */
+  private static handleColumnCountMismatch(
+    expected: number,
+    actual: number,
+    behavior: ColumnCountMismatchBehavior,
+    rowIndex?: number,
+  ): void {
+    if (expected === actual || behavior === 'silent' || behavior === 'extra') {
+      return;
+    }
+
+    const message = AthenaQueryResultParser.describeColumnCountMismatch(
+      expected,
+      actual,
+      rowIndex,
+    );
+
+    if (behavior === 'throw') {
+      throw new Error(message);
+    }
+
+    if (behavior === 'warn') {
+      console.warn(message);
+    }
+  }
+
+  /**
    * Returns a normalized Athena type string used for comparisons.
+   *
+   * @param type - Raw Athena column type from metadata.
    */
   private static normalizeType(type: string | undefined): string {
     return (type ?? '').trim().toLowerCase();
@@ -181,6 +502,8 @@ export class AthenaQueryResultParser {
 
   /**
    * Returns whether the Athena type is treated as a "string-like" type.
+   *
+   * @param type - Raw Athena column type from metadata.
    */
   private static isStringLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -194,6 +517,8 @@ export class AthenaQueryResultParser {
 
   /**
    * Returns whether the Athena type is treated as a "numeric-like" type.
+   *
+   * @param type - Raw Athena column type from metadata.
    */
   private static isNumericLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -212,6 +537,8 @@ export class AthenaQueryResultParser {
 
   /**
    * Returns whether the Athena type is treated as a boolean type.
+   *
+   * @param type - Raw Athena column type from metadata.
    */
   private static isBooleanLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -220,6 +547,8 @@ export class AthenaQueryResultParser {
 
   /**
    * Returns whether the Athena type is treated as a date/time-like type.
+   *
+   * @param type - Raw Athena column type from metadata.
    */
   private static isDateTimeLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -235,8 +564,11 @@ export class AthenaQueryResultParser {
   /**
    * Returns whether a string value looks parseable for the given Athena type.
    *
-   * This is used only for the `'safe'` header-row detection strategy to decide
-   * whether a header-looking row is unlikely to be valid data.
+   * Used only for the `'safe'` header-row detection strategy to decide whether
+   * a header-looking row is unlikely to be valid data.
+   *
+   * @param value - Cell value from the first row.
+   * @param type - Athena column type for that cell.
    */
   private static isParseableAsType(value: string, type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -256,10 +588,15 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Implements the header-row auto detection logic.
+   * Implements header-row auto-detection for `skipHeaderRow: 'auto'`.
    *
    * - `'exact'`: skip when the first row exactly matches headers (legacy)
    * - `'safe'`: require type-based evidence that the row is not valid data
+   *
+   * @param params.firstRow - First row in the result set.
+   * @param params.headers - Resolved header names.
+   * @param params.columnInfo - Column metadata (used by `'safe'` strategy).
+   * @param params.strategy - Detection strategy from options.
    */
   private static shouldAutoSkipHeaderRow(params: {
     firstRow: Row;
@@ -304,6 +641,14 @@ export class AthenaQueryResultParser {
       : { skip: false, reason: 'safe:no-type-evidence' };
   }
 
+  /**
+   * Resolves duplicate header names according to {@link DuplicateColumnNameBehavior}.
+   *
+   * @param headers - Raw header names (may contain duplicates).
+   * @param behavior - Duplicate-name handling strategy.
+   * @returns Resolved header names.
+   * @throws Error When `behavior` is `'throw'` and duplicates exist.
+   */
   private static resolveDuplicateHeaders(
     headers: string[],
     behavior: DuplicateColumnNameBehavior,
@@ -360,6 +705,9 @@ export class AthenaQueryResultParser {
   private duplicateColumnNames: DuplicateColumnNameBehavior = 'throw';
   private lastHeaderRowDecision: HeaderRowDecision | null = null;
 
+  /**
+   * Creates a new parser instance with empty internal state.
+   */
   constructor() {}
 
   /**
@@ -367,6 +715,8 @@ export class AthenaQueryResultParser {
    *
    * This method is idempotent: headers are set only when not already initialized.
    *
+   * @param columnInfo - Column metadata from the Athena `ResultSet`.
+   * @param options - Parser options (for example, duplicate column-name handling).
    * @throws Error When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
    */
@@ -386,7 +736,8 @@ export class AthenaQueryResultParser {
   /**
    * Returns the current headers.
    *
-   * Returns `null` until {@link initHeaders} / {@link parseResultSet} has been called.
+   * @returns Header names, or `null` until {@link initHeaders} or
+   * {@link parseResultSet} has been called.
    */
   getHeaders(): string[] | null {
     return this.headers;
@@ -395,8 +746,10 @@ export class AthenaQueryResultParser {
   /**
    * Returns information about the most recent header-row decision.
    *
-   * This is useful when `skipHeaderRow` is `'auto'` and you need to know whether
-   * the first row was skipped (and why).
+   * Useful when `skipHeaderRow` is `'auto'` and you need to know whether the
+   * first row was skipped (and why).
+   *
+   * @returns The last {@link HeaderRowDecision}, or `null` before any parse.
    */
   getLastHeaderRowDecision(): HeaderRowDecision | null {
     return this.lastHeaderRowDecision;
@@ -408,8 +761,14 @@ export class AthenaQueryResultParser {
    * By default, this method auto-detects and skips the first row when it matches
    * the headers.
    *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Parsing options (header skipping, duplicate names, column-count mismatch, etc.).
+   * @returns Parsed rows keyed by header name. Returns `[]` when `resultSet` is `undefined`
+   * or has no column metadata.
    * @throws Error When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * `Data.length` does not match the header count.
    */
   parseResultSet(
     resultSet: ResultSet | undefined,
@@ -524,8 +883,14 @@ export class AthenaQueryResultParser {
     const skipHeader = decision.skipped;
     const rows = skipHeader ? rawRows.slice(1) : rawRows;
 
-    return rows.map((row) =>
-      AthenaQueryResultParser.rowToObject(row, this.headers!),
+    const columnCountMismatchBehavior =
+      options.columnCountMismatchBehavior ?? 'silent';
+
+    return rows.map((row, rowIndex) =>
+      AthenaQueryResultParser.rowToObject(row, this.headers!, {
+        columnCountMismatchBehavior,
+        rowIndex,
+      }),
     );
   }
 
@@ -533,6 +898,11 @@ export class AthenaQueryResultParser {
    * Parses a {@link ResultSet} and maps each parsed row through a custom parser.
    *
    * Any `null` results returned from `rowParser` are filtered out.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param rowParser - Function that transforms each {@link ParsedRow} into `T`, or `null` to skip.
+   * @param options - Same options as {@link parseResultSet} (including `columnCountMismatchBehavior`).
+   * @returns Mapped values with skipped rows removed.
    */
   parseResultSetWith<T>(
     resultSet: ResultSet | undefined,
@@ -553,7 +923,7 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Resets the parser state (headers and header-row-dropped flag).
+   * Resets the parser state (headers, header-row-dropped flag, and last decision).
    *
    * Call this when reusing a parser instance for a new query.
    */
@@ -565,6 +935,16 @@ export class AthenaQueryResultParser {
 }
 
 /**
- * Re-export static methods for convenience.
+ * Convenience re-exports of {@link AthenaQueryResultParser} static helpers.
+ *
+ * - {@link headersFromMeta} — build headers from column metadata
+ * - {@link rowToObject} — convert a single row to a {@link ParsedRow}
+ * - {@link rowToTypedObject} — convert a single row to a {@link TypedParsedRow}
+ * - {@link isHeaderRow} — detect header-like rows
  */
-export const { headersFromMeta, rowToObject, isHeaderRow } = AthenaQueryResultParser;
+export const {
+  headersFromMeta,
+  rowToObject,
+  rowToTypedObject,
+  isHeaderRow,
+} = AthenaQueryResultParser;

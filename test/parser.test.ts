@@ -4,6 +4,11 @@ import {
   headersFromMeta,
   rowToObject,
   isHeaderRow,
+  EXTRA_COLUMNS_KEY,
+  rowToTypedObject,
+  toNumber,
+  toBoolean,
+  toDate,
   type ParsedRow,
 } from '../src';
 
@@ -38,6 +43,48 @@ const makeResultSetWithTypes = (
 };
 
 describe('AthenaQueryResultParser', () => {
+  describe('value conversion utilities', () => {
+    it('toNumber should return null for null/empty/unparseable values', () => {
+      expect(toNumber(null)).toBeNull();
+      expect(toNumber('')).toBeNull();
+      expect(toNumber('   ')).toBeNull();
+      expect(toNumber('not-a-number')).toBeNull();
+    });
+
+    it('toNumber should parse finite numbers', () => {
+      expect(toNumber('0')).toBe(0);
+      expect(toNumber('  1.25 ')).toBe(1.25);
+      expect(toNumber('-10')).toBe(-10);
+    });
+
+    it('toBoolean should return null for null/empty/unrecognized values', () => {
+      expect(toBoolean(null)).toBeNull();
+      expect(toBoolean('')).toBeNull();
+      expect(toBoolean('   ')).toBeNull();
+      expect(toBoolean('yes')).toBeNull();
+      expect(toBoolean('1')).toBeNull();
+    });
+
+    it('toBoolean should parse true/false (case-insensitive)', () => {
+      expect(toBoolean('true')).toBe(true);
+      expect(toBoolean('TRUE')).toBe(true);
+      expect(toBoolean(' false ')).toBe(false);
+    });
+
+    it('toDate should return null for null/empty/unparseable values', () => {
+      expect(toDate(null)).toBeNull();
+      expect(toDate('')).toBeNull();
+      expect(toDate('   ')).toBeNull();
+      expect(toDate('not-a-date')).toBeNull();
+    });
+
+    it('toDate should parse ISO-like timestamps', () => {
+      const d = toDate('2026-01-01T00:00:00.000Z');
+      expect(d).not.toBeNull();
+      expect(d!.toISOString()).toBe('2026-01-01T00:00:00.000Z');
+    });
+  });
+
   describe('static methods', () => {
     describe('headersFromMeta', () => {
       it('should return header array from ColumnInfo', () => {
@@ -76,6 +123,114 @@ describe('AthenaQueryResultParser', () => {
         const row = makeRow(['a', null, 'c']);
         const headers = ['h1', 'h2', 'h3'];
         expect(rowToObject(row, headers)).toEqual({ h1: 'a', h2: null, h3: 'c' });
+      });
+
+      it('should pad with null when row has fewer cells than headers (silent default)', () => {
+        const row = makeRow(['a']);
+        const headers = ['h1', 'h2', 'h3'];
+        expect(rowToObject(row, headers)).toEqual({ h1: 'a', h2: null, h3: null });
+      });
+
+      it('should discard surplus cells when row has more cells than headers (silent default)', () => {
+        const row = makeRow(['a', 'b', 'c', 'd']);
+        const headers = ['h1', 'h2'];
+        expect(rowToObject(row, headers)).toEqual({ h1: 'a', h2: 'b' });
+      });
+
+      it('should throw in strict mode when column counts differ', () => {
+        const row = makeRow(['a']);
+        const headers = ['h1', 'h2'];
+        expect(() =>
+          rowToObject(row, headers, { columnCountMismatchBehavior: 'throw' }),
+        ).toThrow('Column count mismatch: expected 2 column(s) but row has 1');
+      });
+
+      it('should include row index in strict mode error when provided', () => {
+        const row = makeRow(['a', 'b', 'c']);
+        const headers = ['h1', 'h2'];
+        expect(() =>
+          rowToObject(row, headers, {
+            columnCountMismatchBehavior: 'throw',
+            rowIndex: 3,
+          }),
+        ).toThrow('Column count mismatch at row index 3: expected 2 column(s) but row has 3');
+      });
+
+      it('should warn in warn mode when column counts differ', () => {
+        const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const row = makeRow(['a']);
+        const headers = ['h1', 'h2'];
+        expect(
+          rowToObject(row, headers, { columnCountMismatchBehavior: 'warn' }),
+        ).toEqual({ h1: 'a', h2: null });
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Column count mismatch: expected 2 column(s) but row has 1',
+        );
+        warnSpy.mockRestore();
+      });
+
+      it('should store surplus cells under __extra in extra mode', () => {
+        const row = makeRow(['a', 'b', 'c', 'd']);
+        const headers = ['h1', 'h2'];
+        expect(
+          rowToObject(row, headers, { columnCountMismatchBehavior: 'extra' }),
+        ).toEqual({ h1: 'a', h2: 'b', [EXTRA_COLUMNS_KEY]: ['c', 'd'] });
+      });
+
+      it('should not add __extra when row length matches headers in extra mode', () => {
+        const row = makeRow(['a', 'b']);
+        const headers = ['h1', 'h2'];
+        expect(
+          rowToObject(row, headers, { columnCountMismatchBehavior: 'extra' }),
+        ).toEqual({ h1: 'a', h2: 'b' });
+      });
+    });
+
+    describe('rowToTypedObject', () => {
+      it('should convert values based on ColumnInfo.Type', () => {
+        const row = makeRow(['1', 'true', '2026-01-01T00:00:00.000Z', 'Alice']);
+        const headers = ['id', 'is_active', 'created_at', 'name'];
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'id', type: 'bigint' },
+          { name: 'is_active', type: 'boolean' },
+          { name: 'created_at', type: 'timestamp' },
+          { name: 'name', type: 'varchar' },
+        ]);
+
+        const obj = rowToTypedObject(row, headers, columnInfo);
+        expect(obj.id).toBe(1);
+        expect(obj.is_active).toBe(true);
+        expect(obj.created_at).toBeInstanceOf(Date);
+        expect((obj.created_at as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
+        expect(obj.name).toBe('Alice');
+      });
+
+      it('should keep original string when unparseable (default)', () => {
+        const row = makeRow(['not-a-number']);
+        const headers = ['n'];
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type: 'bigint' }]);
+        expect(rowToTypedObject(row, headers, columnInfo)).toEqual({ n: 'not-a-number' });
+      });
+
+      it('should convert unparseable values to null when configured', () => {
+        const row = makeRow(['not-a-number']);
+        const headers = ['n'];
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type: 'bigint' }]);
+        expect(
+          rowToTypedObject(row, headers, columnInfo, { unparseableValueBehavior: 'null' }),
+        ).toEqual({ n: null });
+      });
+
+      it('should store surplus cells under __extra in extra mode', () => {
+        const row = makeRow(['1', 'Alice', 'surplus1', 'surplus2']);
+        const headers = ['id', 'name'];
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'id', type: 'bigint' },
+          { name: 'name', type: 'varchar' },
+        ]);
+        expect(
+          rowToTypedObject(row, headers, columnInfo, { columnCountMismatchBehavior: 'extra' }),
+        ).toEqual({ id: 1, name: 'Alice', [EXTRA_COLUMNS_KEY]: ['surplus1', 'surplus2'] });
       });
     });
 
@@ -469,6 +624,49 @@ describe('AthenaQueryResultParser', () => {
       parser.reset();
       expect(parser.getHeaders()).toBeNull();
       expect(parser.getLastHeaderRowDecision()).toBeNull();
+    });
+
+    it('should throw when parseResultSet encounters a short row in strict mode', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [['1', 'Alice'], ['2']],
+      );
+      expect(() =>
+        parser.parseResultSet(resultSet, { columnCountMismatchBehavior: 'throw' }),
+      ).toThrow('Column count mismatch at row index 1: expected 2 column(s) but row has 1');
+    });
+
+    it('should store surplus cells via parseResultSet in extra mode', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [['1', 'Alice', 'extra1', 'extra2']],
+      );
+      const rows = parser.parseResultSet(resultSet, {
+        columnCountMismatchBehavior: 'extra',
+        skipHeaderRow: false,
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual({
+        id: '1',
+        name: 'Alice',
+        [EXTRA_COLUMNS_KEY]: ['extra1', 'extra2'],
+      });
+    });
+
+    it('should pass columnCountMismatchBehavior through parseResultSetWith', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1', 'surplus']],
+      );
+      const results = parser.parseResultSetWith(
+        resultSet,
+        (row: ParsedRow) => row,
+        { columnCountMismatchBehavior: 'extra', skipHeaderRow: false },
+      );
+      expect(results[0]).toEqual({ id: '1', [EXTRA_COLUMNS_KEY]: ['surplus'] });
     });
   });
 });
