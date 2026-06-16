@@ -19,6 +19,63 @@ export type ParsedRow = Record<string, string | null> & {
 };
 
 /**
+ * A parsed Athena cell value that has been converted based on the column type.
+ */
+export type AthenaTypedValue = string | number | boolean | Date | null;
+
+/**
+ * A parsed Athena row represented as an object with values converted based on
+ * {@link ColumnInfo.Type}.
+ *
+ * When {@link ColumnCountMismatchBehavior} is `'extra'` and a row has more cells
+ * than headers, surplus values are stored under {@link EXTRA_COLUMNS_KEY}.
+ */
+export type TypedParsedRow = Record<string, AthenaTypedValue> & {
+  [EXTRA_COLUMNS_KEY]?: (string | null)[];
+};
+
+/**
+ * Safely converts a string value to a finite number.
+ *
+ * Returns `null` when the value is `null`, empty/whitespace, or not a finite number.
+ */
+export const toNumber = (value: string | null): number | null => {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Safely converts a string value to a boolean.
+ *
+ * Accepts (case-insensitive) `'true'` and `'false'`.
+ * Returns `null` for `null`, empty/whitespace, or unrecognized values.
+ */
+export const toBoolean = (value: string | null): boolean | null => {
+  if (value == null) return null;
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed.length === 0) return null;
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  return null;
+};
+
+/**
+ * Safely converts a string value to a {@link Date}.
+ *
+ * Uses {@link Date.parse} and returns `null` when parsing fails.
+ */
+export const toDate = (value: string | null): Date | null => {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isNaN(ms) ? null : new Date(ms);
+};
+
+/**
  * A custom row parser that converts a {@link ParsedRow} to `T`.
  *
  * Returning `null` means "skip this row".
@@ -82,6 +139,19 @@ export type RowToObjectOptions = {
    * Zero-based row index included in throw/warn messages when available.
    */
   rowIndex?: number;
+};
+
+/**
+ * Options for {@link AthenaQueryResultParser.rowToTypedObject}.
+ */
+export type RowToTypedObjectOptions = RowToObjectOptions & {
+  /**
+   * How to handle values that cannot be converted based on the column type.
+   *
+   * - `'keep'` (default): keep the original string value
+   * - `'null'`: replace with `null`
+   */
+  unparseableValueBehavior?: 'keep' | 'null';
 };
 
 /**
@@ -262,6 +332,65 @@ export class AthenaQueryResultParser {
   }
 
   /**
+   * Converts an Athena `Row` into a key-value object using the provided headers
+   * and column metadata.
+   *
+   * Values are converted based on {@link ColumnInfo.Type}:
+   *
+   * - numeric-like types (e.g. `bigint`, `double`, `decimal(...)`) → `number`
+   * - `boolean` → `boolean`
+   * - date/time-like types (`date`, `timestamp`, `time`) → `Date`
+   * - other/complex types → `string`
+   *
+   * Conversion is conservative: when a value cannot be parsed for its type, it
+   * is kept as a `string` by default.
+   *
+   * @param row - A single Athena result row.
+   * @param headers - Header names derived from metadata (or otherwise).
+   * @param columnInfo - Column metadata in the same order as `headers`.
+   * @param options - Row conversion options.
+   * @returns A {@link TypedParsedRow} keyed by header name.
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and
+   * `row.Data.length` does not equal `headers.length`.
+   */
+  static rowToTypedObject(
+    row: Row,
+    headers: string[],
+    columnInfo: ColumnInfo[],
+    options: RowToTypedObjectOptions = {},
+  ): TypedParsedRow {
+    const behavior = options.columnCountMismatchBehavior ?? 'silent';
+    const expected = headers.length;
+    const actual = AthenaQueryResultParser.getRowDataLength(row);
+
+    AthenaQueryResultParser.handleColumnCountMismatch(
+      expected,
+      actual,
+      behavior,
+      options.rowIndex,
+    );
+
+    const unparseable = options.unparseableValueBehavior ?? 'keep';
+    const obj: TypedParsedRow = {};
+
+    for (const [index, header] of headers.entries()) {
+      const raw = row.Data?.[index]?.VarCharValue ?? null;
+      const type = columnInfo[index]?.Type;
+      obj[header] = AthenaQueryResultParser.convertTypedValue(raw, type, unparseable);
+    }
+
+    if (behavior === 'extra' && actual > expected) {
+      const extras: (string | null)[] = [];
+      for (let index = expected; index < actual; index += 1) {
+        extras.push(row.Data?.[index]?.VarCharValue ?? null);
+      }
+      obj[EXTRA_COLUMNS_KEY] = extras;
+    }
+
+    return obj;
+  }
+
+  /**
    * Returns whether the given row is a header row (all cells match headers).
    *
    * Compares only the first `headers.length` cells; surplus cells in `row.Data`
@@ -283,6 +412,35 @@ export class AthenaQueryResultParser {
    */
   private static getRowDataLength(row: Row): number {
     return row.Data?.length ?? 0;
+  }
+
+  private static convertTypedValue(
+    value: string | null,
+    type: string | undefined,
+    unparseable: 'keep' | 'null',
+  ): AthenaTypedValue {
+    if (value == null) return null;
+
+    const t = AthenaQueryResultParser.normalizeType(type);
+    if (AthenaQueryResultParser.isNumericLikeType(t)) {
+      const n = toNumber(value);
+      if (n != null) return n;
+      return unparseable === 'null' ? null : value;
+    }
+
+    if (AthenaQueryResultParser.isBooleanLikeType(t)) {
+      const b = toBoolean(value);
+      if (b != null) return b;
+      return unparseable === 'null' ? null : value;
+    }
+
+    if (AthenaQueryResultParser.isDateTimeLikeType(t)) {
+      const d = toDate(value);
+      if (d != null) return d;
+      return unparseable === 'null' ? null : value;
+    }
+
+    return value;
   }
 
   /**
@@ -781,6 +939,12 @@ export class AthenaQueryResultParser {
  *
  * - {@link headersFromMeta} — build headers from column metadata
  * - {@link rowToObject} — convert a single row to a {@link ParsedRow}
+ * - {@link rowToTypedObject} — convert a single row to a {@link TypedParsedRow}
  * - {@link isHeaderRow} — detect header-like rows
  */
-export const { headersFromMeta, rowToObject, isHeaderRow } = AthenaQueryResultParser;
+export const {
+  headersFromMeta,
+  rowToObject,
+  rowToTypedObject,
+  isHeaderRow,
+} = AthenaQueryResultParser;
