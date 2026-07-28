@@ -591,6 +591,7 @@ describe('AthenaQueryResultParser', () => {
         headers: null,
         rawRowCount: 0,
         parsedRowCount: 0,
+        truncatedByMaxRows: false,
       });
     });
 
@@ -601,6 +602,7 @@ describe('AthenaQueryResultParser', () => {
       expect(result.diagnostics.unavailableReason).toBe('headers-unavailable');
       expect(result.diagnostics.headers).toBeNull();
       expect(result.diagnostics.parsedRowCount).toBe(0);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
     });
 
     it('should report null unavailableReason for a genuine empty Rows array', () => {
@@ -612,6 +614,7 @@ describe('AthenaQueryResultParser', () => {
       expect(result.diagnostics.headers).toEqual(['id', 'name']);
       expect(result.diagnostics.rawRowCount).toBe(0);
       expect(result.diagnostics.parsedRowCount).toBe(0);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
       expect(result.diagnostics.headerRowDecision).toEqual({
         mode: 'auto',
         skipped: false,
@@ -661,7 +664,86 @@ describe('AthenaQueryResultParser', () => {
       expect(result.diagnostics.unavailableReason).toBeNull();
       expect(result.diagnostics.rawRowCount).toBe(2);
       expect(result.diagnostics.parsedRowCount).toBe(1);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
       expect(result.diagnostics.headerRowDecision?.skipped).toBe(true);
+    });
+
+    it('should truncate rows when maxRows is set', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3'], ['4']],
+      );
+      const result = parser.parseResultSetDetailed(resultSet, {
+        maxRows: 2,
+        skipHeaderRow: false,
+      });
+      expect(result.rows).toEqual([{ id: '1' }, { id: '2' }]);
+      expect(result.diagnostics.parsedRowCount).toBe(2);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(true);
+    });
+
+    it('should throw when maxRows is exceeded and maxRowsExceededBehavior is throw', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3']],
+      );
+      expect(() =>
+        parser.parseResultSet(resultSet, {
+          maxRows: 2,
+          maxRowsExceededBehavior: 'throw',
+          skipHeaderRow: false,
+        }),
+      ).toThrow('Parsed row count (3) exceeds maxRows (2).');
+    });
+
+    it('should reject invalid maxRows values', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], [['1']]);
+      expect(() =>
+        parser.parseResultSet(resultSet, { maxRows: -1, skipHeaderRow: false }),
+      ).toThrow('maxRows must be a non-negative integer when specified.');
+      expect(() =>
+        parser.parseResultSet(resultSet, { maxRows: 1.5, skipHeaderRow: false }),
+      ).toThrow('maxRows must be a non-negative integer when specified.');
+    });
+
+    it('should yield rows lazily via parseResultSetIter', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+          ['2', 'Bob'],
+        ],
+      );
+      const rows = [...parser.parseResultSetIter(resultSet)];
+      expect(rows).toEqual([
+        { id: '1', name: 'Alice' },
+        { id: '2', name: 'Bob' },
+      ]);
+    });
+
+    it('should honor maxRows in parseResultSetIter', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3']],
+      );
+      const rows = [
+        ...parser.parseResultSetIter(resultSet, {
+          maxRows: 2,
+          skipHeaderRow: false,
+        }),
+      ];
+      expect(rows).toEqual([{ id: '1' }, { id: '2' }]);
+    });
+
+    it('should yield nothing from parseResultSetIter for undefined ResultSet', () => {
+      const parser = new AthenaQueryResultParser();
+      expect([...parser.parseResultSetIter(undefined)]).toEqual([]);
     });
 
     it('should apply custom parser with parseResultSetWith and filter out nulls', () => {
