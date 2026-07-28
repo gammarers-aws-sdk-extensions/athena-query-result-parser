@@ -412,6 +412,73 @@ describe('AthenaQueryResultParser', () => {
       });
     });
 
+    it('should isolate each parse when reusePolicy is fresh-each-parse', () => {
+      const parser = new AthenaQueryResultParser({
+        reusePolicy: 'fresh-each-parse',
+      });
+      const resultSet = makeResultSet(
+        ['id'],
+        [
+          ['id'],
+          ['1'],
+        ],
+      );
+      expect(parser.parseResultSet(resultSet)).toEqual([{ id: '1' }]);
+      // Without fresh-each-parse, the second call would keep the header-like row.
+      expect(parser.parseResultSet(resultSet)).toEqual([{ id: '1' }]);
+      expect(parser.getReusePolicy()).toBe('fresh-each-parse');
+    });
+
+    it('should expose active query state for reset guidance', () => {
+      const parser = AthenaQueryResultParser.create();
+      expect(parser.hasActiveQueryState()).toBe(false);
+      parser.parseResultSet(makeResultSet(['id'], [['1']]), {
+        skipHeaderRow: false,
+      });
+      expect(parser.hasActiveQueryState()).toBe(true);
+      parser.reset();
+      expect(parser.hasActiveQueryState()).toBe(false);
+    });
+
+    it('should parse independently via parseResultSetOnce', () => {
+      const resultSet = makeResultSet(
+        ['id'],
+        [
+          ['id'],
+          ['1'],
+        ],
+      );
+      expect(AthenaQueryResultParser.parseResultSetOnce(resultSet)).toEqual([
+        { id: '1' },
+      ]);
+      expect(AthenaQueryResultParser.parseResultSetOnce(resultSet)).toEqual([
+        { id: '1' },
+      ]);
+    });
+
+    it('should support detailed/iter/with once helpers', () => {
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+        ],
+      );
+      const detailed = AthenaQueryResultParser.parseResultSetDetailedOnce(resultSet);
+      expect(detailed.rows).toEqual([{ id: '1', name: 'Alice' }]);
+      expect(detailed.diagnostics.headerRowDecision?.skipped).toBe(true);
+
+      expect([...AthenaQueryResultParser.parseResultSetIterOnce(resultSet)]).toEqual([
+        { id: '1', name: 'Alice' },
+      ]);
+
+      const mapped = AthenaQueryResultParser.parseResultSetWithOnce(
+        resultSet,
+        (row) => row.id,
+      );
+      expect(mapped).toEqual(['1']);
+    });
+
     it('should avoid false-positive header skipping in safe strategy when all columns are varchar', () => {
       const parser = new AthenaQueryResultParser();
       const resultSet = makeResultSet(

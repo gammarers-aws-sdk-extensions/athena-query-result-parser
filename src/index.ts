@@ -309,12 +309,42 @@ export type ParseResultSetDetailedResult = {
 };
 
 /**
+ * Controls how an {@link AthenaQueryResultParser} instance reuses internal state
+ * across parse calls.
+ *
+ * - `'paginate'` (default): retain headers and the header-row-dropped flag so
+ *   consecutive pages of the **same** Athena query share state
+ * - `'fresh-each-parse'`: call {@link AthenaQueryResultParser.reset} before every
+ *   parse, so each call is independent (safer when reusing one instance across
+ *   different queries without remembering to reset)
+ *
+ * For a single `ResultSet`, prefer the static `*Once` helpers
+ * (for example {@link AthenaQueryResultParser.parseResultSetOnce}).
+ */
+export type ParserReusePolicy = 'paginate' | 'fresh-each-parse';
+
+/**
+ * Construction options for {@link AthenaQueryResultParser}.
+ */
+export type AthenaQueryResultParserOptions = {
+  /**
+   * How instance state is reused across parse calls.
+   *
+   * Default: `'paginate'`.
+   *
+   * @see ParserReusePolicy
+   */
+  reusePolicy?: ParserReusePolicy;
+};
+
+/**
  * Options for parsing an Athena {@link ResultSet}.
  *
  * Accepted by {@link AthenaQueryResultParser.parseResultSet},
  * {@link AthenaQueryResultParser.parseResultSetDetailed},
- * {@link AthenaQueryResultParser.parseResultSetIter}, and
- * {@link AthenaQueryResultParser.parseResultSetWith}.
+ * {@link AthenaQueryResultParser.parseResultSetIter},
+ * {@link AthenaQueryResultParser.parseResultSetWith}, and the static `*Once`
+ * helpers.
  */
 export type ParseResultSetOptions = {
   /**
@@ -397,7 +427,16 @@ export type ParseResultSetOptions = {
 /**
  * Parses Athena query results into header-based row objects.
  *
- * Handles metadata-driven headers, optional header-row skipping, duplicate
+ * **Stateful by default:** instance methods retain headers and whether a header
+ * row was already dropped so consecutive `GetQueryResults` pages of the **same**
+ * query can be parsed safely. Call {@link reset} (or create a new instance)
+ * before parsing a different query. Misusing one instance across queries without
+ * reset can skip or keep header rows incorrectly.
+ *
+ * Prefer the static `*Once` helpers for one-off parses, or construct with
+ * `{ reusePolicy: 'fresh-each-parse' }` to isolate each parse automatically.
+ *
+ * Also handles metadata-driven headers, optional header-row skipping, duplicate
  * column-name resolution, configurable row/column-count mismatch behavior,
  * row limits for large result sets, streaming via
  * {@link AthenaQueryResultParser.parseResultSetIter}, and parse diagnostics via
@@ -547,6 +586,90 @@ export class AthenaQueryResultParser {
     if (!row?.Data?.length) return false;
     return headers.every(
       (header, index) => (row.Data?.[index]?.VarCharValue ?? null) === header,
+    );
+  }
+
+  /**
+   * Creates a parser for paginating pages of one Athena query.
+   *
+   * Call {@link reset} (or {@link create} again) before parsing another query.
+   * For a single `ResultSet`, prefer {@link parseResultSetOnce}.
+   *
+   * @param options - Optional construction options (for example `reusePolicy`).
+   * @returns A new {@link AthenaQueryResultParser} instance.
+   */
+  static create(
+    options: AthenaQueryResultParserOptions = {},
+  ): AthenaQueryResultParser {
+    return new AthenaQueryResultParser(options);
+  }
+
+  /**
+   * Stateless one-shot parse: returns rows without retaining parser state.
+   *
+   * Equivalent to `AthenaQueryResultParser.create().parseResultSet(...)` on a
+   * throwaway instance. Prefer this over reusing an instance across queries
+   * without {@link reset}.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSet}.
+   * @returns Parsed rows keyed by header name.
+   */
+  static parseResultSetOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParsedRow[] {
+    return AthenaQueryResultParser.create().parseResultSet(resultSet, options);
+  }
+
+  /**
+   * Stateless one-shot parse with diagnostics.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSetDetailed}.
+   * @returns Parsed rows plus {@link ParseResultSetDiagnostics}.
+   */
+  static parseResultSetDetailedOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParseResultSetDetailedResult {
+    return AthenaQueryResultParser.create().parseResultSetDetailed(
+      resultSet,
+      options,
+    );
+  }
+
+  /**
+   * Stateless one-shot lazy parse.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSetIter}.
+   * @yields Parsed rows keyed by header name.
+   */
+  static *parseResultSetIterOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): Generator<ParsedRow, void, undefined> {
+    yield* AthenaQueryResultParser.create().parseResultSetIter(resultSet, options);
+  }
+
+  /**
+   * Stateless one-shot parse with a custom row mapper.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param rowParser - Function that transforms each {@link ParsedRow} into `T`, or `null` to skip.
+   * @param options - Same options as {@link parseResultSetWith}.
+   * @returns Mapped values with skipped rows removed.
+   */
+  static parseResultSetWithOnce<T>(
+    resultSet: ResultSet | undefined,
+    rowParser: RowParser<T>,
+    options: ParseResultSetOptions = {},
+  ): T[] {
+    return AthenaQueryResultParser.create().parseResultSetWith(
+      resultSet,
+      rowParser,
+      options,
     );
   }
 
@@ -951,11 +1074,44 @@ export class AthenaQueryResultParser {
   private headerRowDropped = false;
   private duplicateColumnNames: DuplicateColumnNameBehavior = 'throw';
   private lastHeaderRowDecision: HeaderRowDecision | null = null;
+  private readonly reusePolicy: ParserReusePolicy;
 
   /**
    * Creates a new parser instance with empty internal state.
+   *
+   * Default {@link ParserReusePolicy} is `'paginate'` (retain state across pages
+   * of one query). Pass `{ reusePolicy: 'fresh-each-parse' }` to reset before
+   * every parse when reusing the instance across queries.
+   *
+   * @param options - Construction options.
    */
-  constructor() {}
+  constructor(options: AthenaQueryResultParserOptions = {}) {
+    this.reusePolicy = options.reusePolicy ?? 'paginate';
+  }
+
+  /**
+   * Returns the configured {@link ParserReusePolicy}.
+   */
+  getReusePolicy(): ParserReusePolicy {
+    return this.reusePolicy;
+  }
+
+  /**
+   * Returns whether this instance currently holds parse state that would affect
+   * a later call (headers, header-row-dropped flag, or last header decision).
+   *
+   * When `true` and you are starting a **different** Athena query, call
+   * {@link reset} first (unless `reusePolicy` is `'fresh-each-parse'`).
+   *
+   * @returns `true` when mutable parse state is present.
+   */
+  hasActiveQueryState(): boolean {
+    return (
+      this.headers != null ||
+      this.headerRowDropped ||
+      this.lastHeaderRowDecision != null
+    );
+  }
 
   /**
    * Initializes headers from column metadata.
@@ -1015,6 +1171,9 @@ export class AthenaQueryResultParser {
    * Does not apply {@link ParseResultSetOptions.maxRows}; callers resolve the
    * emit limit separately.
    *
+   * When {@link ParserReusePolicy} is `'fresh-each-parse'`, clears prior state
+   * via {@link reset} before preparing.
+   *
    * @param resultSet - Athena query result payload, or `undefined`.
    * @param options - Parsing options.
    * @returns Either an unavailable reason or a ready parse context (headers,
@@ -1037,6 +1196,10 @@ export class AthenaQueryResultParser {
       dataRowCount: number;
       decision: HeaderRowDecision;
     } {
+    if (this.reusePolicy === 'fresh-each-parse') {
+      this.reset();
+    }
+
     if (!resultSet) {
       return { status: 'unavailable', reason: 'result-set-undefined' };
     }
@@ -1381,7 +1544,13 @@ export class AthenaQueryResultParser {
   /**
    * Resets the parser state (headers, header-row-dropped flag, and last decision).
    *
-   * Call this when reusing a parser instance for a new query.
+   * **Required** before reusing a `'paginate'` instance for a **different**
+   * Athena query. Not needed between pages of the same query (that is what
+   * `'paginate'` is for). Prefer {@link parseResultSetOnce} for one-off parses,
+   * or `{ reusePolicy: 'fresh-each-parse' }` to reset automatically.
+   *
+   * @see hasActiveQueryState
+   * @see ParserReusePolicy
    */
   reset(): void {
     this.headers = null;
@@ -1397,10 +1566,18 @@ export class AthenaQueryResultParser {
  * - {@link rowToObject} — convert a single row to a {@link ParsedRow}
  * - {@link rowToTypedObject} — convert a single row to a {@link TypedParsedRow}
  * - {@link isHeaderRow} — detect header-like rows
+ * - {@link parseResultSetOnce} — stateless one-shot parse
+ * - {@link parseResultSetDetailedOnce} — stateless one-shot parse with diagnostics
+ * - {@link parseResultSetIterOnce} — stateless one-shot lazy parse
+ * - {@link parseResultSetWithOnce} — stateless one-shot parse with a row mapper
  */
 export const {
   headersFromMeta,
   rowToObject,
   rowToTypedObject,
   isHeaderRow,
+  parseResultSetOnce,
+  parseResultSetDetailedOnce,
+  parseResultSetIterOnce,
+  parseResultSetWithOnce,
 } = AthenaQueryResultParser;
