@@ -5,7 +5,7 @@ const project = new typescript.TypeScriptProject({
   defaultReleaseBranch: 'main',
   name: 'athena-query-result-parser',
   projenrcTs: true,
-  typescriptVersion: '5.9.x',
+  typescriptVersion: '6.0.x',
   packageManager: javascript.NodePackageManager.YARN_CLASSIC,
   repository: 'https://github.com/gammarers-aws-sdk-extensions/athena-query-result-parser.git',
   description: 'A small TypeScript library that parses Amazon Athena query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It handles metadata-driven headers, skips the header row when present, and supports custom row transformers.',
