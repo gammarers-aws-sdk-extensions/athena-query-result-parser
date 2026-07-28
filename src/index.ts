@@ -38,6 +38,9 @@ export type TypedParsedRow = Record<string, AthenaTypedValue> & {
  * Safely converts a string value to a finite number.
  *
  * Returns `null` when the value is `null`, empty/whitespace, or not a finite number.
+ *
+ * @param value - Raw Athena cell value.
+ * @returns A finite number, or `null` when conversion is not possible.
  */
 export const toNumber = (value: string | null): number | null => {
   if (value == null) return null;
@@ -52,6 +55,9 @@ export const toNumber = (value: string | null): number | null => {
  *
  * Accepts (case-insensitive) `'true'` and `'false'`.
  * Returns `null` for `null`, empty/whitespace, or unrecognized values.
+ *
+ * @param value - Raw Athena cell value.
+ * @returns `true` / `false`, or `null` when conversion is not possible.
  */
 export const toBoolean = (value: string | null): boolean | null => {
   if (value == null) return null;
@@ -66,6 +72,9 @@ export const toBoolean = (value: string | null): boolean | null => {
  * Safely converts a string value to a {@link Date}.
  *
  * Uses {@link Date.parse} and returns `null` when parsing fails.
+ *
+ * @param value - Raw Athena cell value.
+ * @returns A {@link Date}, or `null` when conversion is not possible.
  */
 export const toDate = (value: string | null): Date | null => {
   if (value == null) return null;
@@ -167,7 +176,9 @@ export type HeaderRowDetectionStrategy = 'exact' | 'safe';
  * Describes whether and why a header row was skipped.
  *
  * Inspect via {@link AthenaQueryResultParser.getLastHeaderRowDecision} after
- * {@link AthenaQueryResultParser.parseResultSet}.
+ * {@link AthenaQueryResultParser.parseResultSet},
+ * {@link AthenaQueryResultParser.parseResultSetDetailed}, or
+ * {@link AthenaQueryResultParser.parseResultSetIter}.
  *
  * When {@link ParseResultSetOptions.skipHeaderRow} is `'auto'`, this decision is
  * derived from {@link HeaderRowDetectionStrategy} and the incoming `ResultSet`.
@@ -203,7 +214,137 @@ type AutoHeaderRowDecision = Extract<HeaderRowDecision, { mode: 'auto' }>;
 type AutoHeaderRowReason = AutoHeaderRowDecision['reason'];
 
 /**
+ * Why {@link AthenaQueryResultParser.parseResultSet},
+ * {@link AthenaQueryResultParser.parseResultSetDetailed}, or
+ * {@link AthenaQueryResultParser.parseResultSetIter} produced no rows without
+ * processing row data.
+ *
+ * Distinct from a genuine empty `Rows` array (headers available, zero data rows).
+ *
+ * - `'result-set-undefined'`: the `ResultSet` argument was `undefined`
+ * - `'headers-unavailable'`: no column metadata and headers were not initialized
+ */
+export type ParseResultSetUnavailableReason =
+  | 'result-set-undefined'
+  | 'headers-unavailable';
+
+/**
+ * Behavior when the `ResultSet` cannot be parsed because it is `undefined` or
+ * headers cannot be determined.
+ *
+ * Does **not** apply when headers are available and `Rows` is simply empty.
+ *
+ * - `'silent'` (default): return `[]` (or yield nothing from
+ *   {@link AthenaQueryResultParser.parseResultSetIter})
+ * - `'throw'`: throw an Error describing the reason
+ *
+ * @see ParseResultSetOptions.unavailableResultBehavior
+ */
+export type UnavailableResultBehavior = 'silent' | 'throw';
+
+/**
+ * Behavior when the number of data rows exceeds {@link ParseResultSetOptions.maxRows}.
+ *
+ * - `'truncate'` (default): return/yield only the first `maxRows` rows
+ * - `'throw'`: throw an Error before producing rows
+ *
+ * Ignored when `maxRows` is omitted.
+ *
+ * @see ParseResultSetOptions.maxRowsExceededBehavior
+ */
+export type MaxRowsExceededBehavior = 'truncate' | 'throw';
+
+/**
+ * Diagnostics for a {@link AthenaQueryResultParser.parseResultSetDetailed} call.
+ *
+ * Use `unavailableReason` to distinguish "could not parse" empty results from
+ * a genuine empty `Rows` array, and `truncatedByMaxRows` to detect
+ * {@link ParseResultSetOptions.maxRows} truncation.
+ */
+export type ParseResultSetDiagnostics = {
+  /**
+   * Present when parsing could not proceed. `null` when parsing completed
+   * normally (including a genuine empty `Rows` array).
+   */
+  unavailableReason: ParseResultSetUnavailableReason | null;
+  /**
+   * Header-row skip decision for this parse, or `null` when parsing was unavailable.
+   */
+  headerRowDecision: HeaderRowDecision | null;
+  /**
+   * Headers used for this parse, or `null` when unavailable.
+   */
+  headers: string[] | null;
+  /**
+   * Number of raw rows in `ResultSet.Rows` before header skipping
+   * (`0` when unavailable).
+   */
+  rawRowCount: number;
+  /**
+   * Number of rows returned after header skipping (and after applying
+   * {@link ParseResultSetOptions.maxRows}, if set).
+   */
+  parsedRowCount: number;
+  /**
+   * `true` when {@link ParseResultSetOptions.maxRows} limited the number of
+   * returned rows ({@link MaxRowsExceededBehavior} `'truncate'`).
+   */
+  truncatedByMaxRows: boolean;
+};
+
+/**
+ * Result of {@link AthenaQueryResultParser.parseResultSetDetailed}.
+ */
+export type ParseResultSetDetailedResult = {
+  /**
+   * Parsed rows keyed by header name (empty when parsing was unavailable,
+   * `Rows` contained no data rows after header skipping, or `maxRows` is `0`).
+   */
+  rows: ParsedRow[];
+  /**
+   * Details about unavailable input, header-row handling, row counts, and
+   * whether {@link ParseResultSetOptions.maxRows} truncated the output.
+   */
+  diagnostics: ParseResultSetDiagnostics;
+};
+
+/**
+ * Controls how an {@link AthenaQueryResultParser} instance reuses internal state
+ * across parse calls.
+ *
+ * - `'paginate'` (default): retain headers and the header-row-dropped flag so
+ *   consecutive pages of the **same** Athena query share state
+ * - `'fresh-each-parse'`: call {@link AthenaQueryResultParser.reset} before every
+ *   parse, so each call is independent (safer when reusing one instance across
+ *   different queries without remembering to reset)
+ *
+ * For a single `ResultSet`, prefer the static `*Once` helpers
+ * (for example {@link AthenaQueryResultParser.parseResultSetOnce}).
+ */
+export type ParserReusePolicy = 'paginate' | 'fresh-each-parse';
+
+/**
+ * Construction options for {@link AthenaQueryResultParser}.
+ */
+export type AthenaQueryResultParserOptions = {
+  /**
+   * How instance state is reused across parse calls.
+   *
+   * Default: `'paginate'`.
+   *
+   * @see ParserReusePolicy
+   */
+  reusePolicy?: ParserReusePolicy;
+};
+
+/**
  * Options for parsing an Athena {@link ResultSet}.
+ *
+ * Accepted by {@link AthenaQueryResultParser.parseResultSet},
+ * {@link AthenaQueryResultParser.parseResultSetDetailed},
+ * {@link AthenaQueryResultParser.parseResultSetIter},
+ * {@link AthenaQueryResultParser.parseResultSetWith}, and the static `*Once`
+ * helpers.
  */
 export type ParseResultSetOptions = {
   /**
@@ -252,13 +393,54 @@ export type ParseResultSetOptions = {
    * @see ColumnCountMismatchBehavior
    */
   columnCountMismatchBehavior?: ColumnCountMismatchBehavior;
+  /**
+   * Behavior when the `ResultSet` is `undefined` or headers cannot be determined.
+   *
+   * Default: `'silent'` (legacy behavior: return `[]`).
+   *
+   * Does not apply when headers are available and `Rows` is simply empty.
+   *
+   * @see UnavailableResultBehavior
+   */
+  unavailableResultBehavior?: UnavailableResultBehavior;
+  /**
+   * Maximum number of parsed data rows to return or yield.
+   *
+   * Counts rows after header-row skipping. Omit for no limit.
+   * When set, must be a non-negative integer.
+   *
+   * @see ParseResultSetOptions.maxRowsExceededBehavior
+   */
+  maxRows?: number;
+  /**
+   * Behavior when the number of data rows exceeds {@link ParseResultSetOptions.maxRows}.
+   *
+   * Default: `'truncate'`.
+   *
+   * Ignored when `maxRows` is omitted.
+   *
+   * @see MaxRowsExceededBehavior
+   */
+  maxRowsExceededBehavior?: MaxRowsExceededBehavior;
 };
 
 /**
  * Parses Athena query results into header-based row objects.
  *
- * Handles metadata-driven headers, optional header-row skipping, duplicate
- * column-name resolution, and configurable row/column-count mismatch behavior.
+ * **Stateful by default:** instance methods retain headers and whether a header
+ * row was already dropped so consecutive `GetQueryResults` pages of the **same**
+ * query can be parsed safely. Call {@link reset} (or create a new instance)
+ * before parsing a different query. Misusing one instance across queries without
+ * reset can skip or keep header rows incorrectly.
+ *
+ * Prefer the static `*Once` helpers for one-off parses, or construct with
+ * `{ reusePolicy: 'fresh-each-parse' }` to isolate each parse automatically.
+ *
+ * Also handles metadata-driven headers, optional header-row skipping, duplicate
+ * column-name resolution, configurable row/column-count mismatch behavior,
+ * row limits for large result sets, streaming via
+ * {@link AthenaQueryResultParser.parseResultSetIter}, and parse diagnostics via
+ * {@link AthenaQueryResultParser.parseResultSetDetailed}.
  */
 export class AthenaQueryResultParser {
 
@@ -408,12 +590,108 @@ export class AthenaQueryResultParser {
   }
 
   /**
+   * Creates a parser for paginating pages of one Athena query.
+   *
+   * Call {@link reset} (or {@link create} again) before parsing another query.
+   * For a single `ResultSet`, prefer {@link parseResultSetOnce}.
+   *
+   * @param options - Optional construction options (for example `reusePolicy`).
+   * @returns A new {@link AthenaQueryResultParser} instance.
+   */
+  static create(
+    options: AthenaQueryResultParserOptions = {},
+  ): AthenaQueryResultParser {
+    return new AthenaQueryResultParser(options);
+  }
+
+  /**
+   * Stateless one-shot parse: returns rows without retaining parser state.
+   *
+   * Equivalent to `AthenaQueryResultParser.create().parseResultSet(...)` on a
+   * throwaway instance. Prefer this over reusing an instance across queries
+   * without {@link reset}.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSet}.
+   * @returns Parsed rows keyed by header name.
+   */
+  static parseResultSetOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParsedRow[] {
+    return AthenaQueryResultParser.create().parseResultSet(resultSet, options);
+  }
+
+  /**
+   * Stateless one-shot parse with diagnostics.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSetDetailed}.
+   * @returns Parsed rows plus {@link ParseResultSetDiagnostics}.
+   */
+  static parseResultSetDetailedOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParseResultSetDetailedResult {
+    return AthenaQueryResultParser.create().parseResultSetDetailed(
+      resultSet,
+      options,
+    );
+  }
+
+  /**
+   * Stateless one-shot lazy parse.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSetIter}.
+   * @yields Parsed rows keyed by header name.
+   */
+  static *parseResultSetIterOnce(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): Generator<ParsedRow, void, undefined> {
+    yield* AthenaQueryResultParser.create().parseResultSetIter(resultSet, options);
+  }
+
+  /**
+   * Stateless one-shot parse with a custom row mapper.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param rowParser - Function that transforms each {@link ParsedRow} into `T`, or `null` to skip.
+   * @param options - Same options as {@link parseResultSetWith}.
+   * @returns Mapped values with skipped rows removed.
+   */
+  static parseResultSetWithOnce<T>(
+    resultSet: ResultSet | undefined,
+    rowParser: RowParser<T>,
+    options: ParseResultSetOptions = {},
+  ): T[] {
+    return AthenaQueryResultParser.create().parseResultSetWith(
+      resultSet,
+      rowParser,
+      options,
+    );
+  }
+
+  /**
    * Returns the number of cells in `row.Data`, or `0` when `Data` is absent.
+   *
+   * @param row - A single Athena result row.
+   * @returns The length of `row.Data`.
    */
   private static getRowDataLength(row: Row): number {
     return row.Data?.length ?? 0;
   }
 
+  /**
+   * Converts a raw Athena cell string to a typed value based on column type.
+   *
+   * @param value - Raw `VarCharValue` (or `null` when missing).
+   * @param type - Athena column type from metadata.
+   * @param unparseable - Whether to keep the original string or return `null`
+   * when conversion fails.
+   * @returns A typed value, or the original string / `null` when unparseable.
+   */
   private static convertTypedValue(
     value: string | null,
     type: string | undefined,
@@ -449,6 +727,7 @@ export class AthenaQueryResultParser {
    * @param expected - Expected column count (typically `headers.length`).
    * @param actual - Actual `row.Data` length.
    * @param rowIndex - Optional zero-based row index for context.
+   * @returns A message suitable for throw/warn.
    */
   private static describeColumnCountMismatch(
     expected: number,
@@ -460,10 +739,94 @@ export class AthenaQueryResultParser {
   }
 
   /**
+   * Builds a human-readable message for an unavailable parse result.
+   *
+   * @param reason - Why parsing could not proceed.
+   * @returns A message describing the unavailable reason.
+   */
+  private static describeUnavailableResult(
+    reason: ParseResultSetUnavailableReason,
+  ): string {
+    if (reason === 'result-set-undefined') {
+      return 'ResultSet is undefined; cannot parse rows.';
+    }
+
+    return (
+      'Headers are unavailable: ResultSet has no ColumnInfo metadata ' +
+      'and headers have not been initialized.'
+    );
+  }
+
+  /**
+   * Builds a human-readable message when data rows exceed `maxRows`.
+   *
+   * @param actual - Number of data rows after header skipping.
+   * @param maxRows - Configured row limit.
+   * @returns A message suitable for throw.
+   */
+  private static describeMaxRowsExceeded(actual: number, maxRows: number): string {
+    return `Parsed row count (${actual}) exceeds maxRows (${maxRows}).`;
+  }
+
+  /**
+   * Validates {@link ParseResultSetOptions.maxRows} when provided.
+   *
+   * @param maxRows - Optional row limit from options.
+   * @throws Error When `maxRows` is not a non-negative integer.
+   */
+  private static assertValidMaxRows(maxRows: number | undefined): void {
+    if (maxRows == null) {
+      return;
+    }
+
+    if (!Number.isInteger(maxRows) || maxRows < 0) {
+      throw new Error('maxRows must be a non-negative integer when specified.');
+    }
+  }
+
+  /**
+   * Resolves how many data rows to emit given {@link ParseResultSetOptions.maxRows}.
+   *
+   * @param dataRowCount - Number of data rows after header skipping.
+   * @param options - Parsing options.
+   * @returns The emit limit and whether truncation occurred.
+   * @throws Error When `maxRows` is invalid, or when the count exceeds `maxRows`
+   * and `maxRowsExceededBehavior` is `'throw'`.
+   */
+  private static resolveRowLimit(
+    dataRowCount: number,
+    options: ParseResultSetOptions,
+  ): { emitCount: number; truncatedByMaxRows: boolean } {
+    const maxRows = options.maxRows;
+    AthenaQueryResultParser.assertValidMaxRows(maxRows);
+
+    if (maxRows == null) {
+      return { emitCount: dataRowCount, truncatedByMaxRows: false };
+    }
+
+    if (dataRowCount > maxRows) {
+      const behavior = options.maxRowsExceededBehavior ?? 'truncate';
+      if (behavior === 'throw') {
+        throw new Error(
+          AthenaQueryResultParser.describeMaxRowsExceeded(dataRowCount, maxRows),
+        );
+      }
+
+      return { emitCount: maxRows, truncatedByMaxRows: true };
+    }
+
+    return { emitCount: dataRowCount, truncatedByMaxRows: false };
+  }
+
+  /**
    * Applies {@link ColumnCountMismatchBehavior} when counts differ.
    *
    * No-op for `'silent'` and `'extra'` (callers handle `'extra'` mapping).
    *
+   * @param expected - Expected column count.
+   * @param actual - Actual `row.Data` length.
+   * @param behavior - Mismatch handling strategy.
+   * @param rowIndex - Optional zero-based row index for messages.
    * @throws Error When `behavior` is `'throw'`.
    */
   private static handleColumnCountMismatch(
@@ -495,6 +858,7 @@ export class AthenaQueryResultParser {
    * Returns a normalized Athena type string used for comparisons.
    *
    * @param type - Raw Athena column type from metadata.
+   * @returns Lowercased trimmed type string, or `''` when missing.
    */
   private static normalizeType(type: string | undefined): string {
     return (type ?? '').trim().toLowerCase();
@@ -504,6 +868,7 @@ export class AthenaQueryResultParser {
    * Returns whether the Athena type is treated as a "string-like" type.
    *
    * @param type - Raw Athena column type from metadata.
+   * @returns `true` for string/varchar/char/varbinary-like types.
    */
   private static isStringLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -519,6 +884,7 @@ export class AthenaQueryResultParser {
    * Returns whether the Athena type is treated as a "numeric-like" type.
    *
    * @param type - Raw Athena column type from metadata.
+   * @returns `true` for integer/floating/decimal-like types.
    */
   private static isNumericLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -539,6 +905,7 @@ export class AthenaQueryResultParser {
    * Returns whether the Athena type is treated as a boolean type.
    *
    * @param type - Raw Athena column type from metadata.
+   * @returns `true` when the type is `boolean`.
    */
   private static isBooleanLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -549,6 +916,7 @@ export class AthenaQueryResultParser {
    * Returns whether the Athena type is treated as a date/time-like type.
    *
    * @param type - Raw Athena column type from metadata.
+   * @returns `true` for date/timestamp/time-like types.
    */
   private static isDateTimeLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -569,6 +937,7 @@ export class AthenaQueryResultParser {
    *
    * @param value - Cell value from the first row.
    * @param type - Athena column type for that cell.
+   * @returns `true` when `value` appears valid for `type`.
    */
   private static isParseableAsType(value: string, type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);
@@ -597,6 +966,7 @@ export class AthenaQueryResultParser {
    * @param params.headers - Resolved header names.
    * @param params.columnInfo - Column metadata (used by `'safe'` strategy).
    * @param params.strategy - Detection strategy from options.
+   * @returns Whether to skip the first row and the corresponding reason code.
    */
   private static shouldAutoSkipHeaderRow(params: {
     firstRow: Row;
@@ -704,16 +1074,51 @@ export class AthenaQueryResultParser {
   private headerRowDropped = false;
   private duplicateColumnNames: DuplicateColumnNameBehavior = 'throw';
   private lastHeaderRowDecision: HeaderRowDecision | null = null;
+  private readonly reusePolicy: ParserReusePolicy;
 
   /**
    * Creates a new parser instance with empty internal state.
+   *
+   * Default {@link ParserReusePolicy} is `'paginate'` (retain state across pages
+   * of one query). Pass `{ reusePolicy: 'fresh-each-parse' }` to reset before
+   * every parse when reusing the instance across queries.
+   *
+   * @param options - Construction options.
    */
-  constructor() {}
+  constructor(options: AthenaQueryResultParserOptions = {}) {
+    this.reusePolicy = options.reusePolicy ?? 'paginate';
+  }
+
+  /**
+   * Returns the configured {@link ParserReusePolicy}.
+   */
+  getReusePolicy(): ParserReusePolicy {
+    return this.reusePolicy;
+  }
+
+  /**
+   * Returns whether this instance currently holds parse state that would affect
+   * a later call (headers, header-row-dropped flag, or last header decision).
+   *
+   * When `true` and you are starting a **different** Athena query, call
+   * {@link reset} first (unless `reusePolicy` is `'fresh-each-parse'`).
+   *
+   * @returns `true` when mutable parse state is present.
+   */
+  hasActiveQueryState(): boolean {
+    return (
+      this.headers != null ||
+      this.headerRowDropped ||
+      this.lastHeaderRowDecision != null
+    );
+  }
 
   /**
    * Initializes headers from column metadata.
    *
    * This method is idempotent: headers are set only when not already initialized.
+   * Also invoked indirectly by {@link parseResultSet},
+   * {@link parseResultSetDetailed}, and {@link parseResultSetIter}.
    *
    * @param columnInfo - Column metadata from the Athena `ResultSet`.
    * @param options - Parser options (for example, duplicate column-name handling).
@@ -736,8 +1141,9 @@ export class AthenaQueryResultParser {
   /**
    * Returns the current headers.
    *
-   * @returns Header names, or `null` until {@link initHeaders} or
-   * {@link parseResultSet} has been called.
+   * @returns Header names, or `null` until {@link initHeaders},
+   * {@link parseResultSet}, {@link parseResultSetDetailed}, or
+   * {@link parseResultSetIter} has initialized them.
    */
   getHeaders(): string[] | null {
     return this.headers;
@@ -747,45 +1153,65 @@ export class AthenaQueryResultParser {
    * Returns information about the most recent header-row decision.
    *
    * Useful when `skipHeaderRow` is `'auto'` and you need to know whether the
-   * first row was skipped (and why).
+   * first row was skipped (and why). Updated by successful
+   * {@link parseResultSet} / {@link parseResultSetDetailed} /
+   * {@link parseResultSetIter} calls; unavailable early exits (undefined
+   * `ResultSet` or missing headers) leave the previous value unchanged.
    *
-   * @returns The last {@link HeaderRowDecision}, or `null` before any parse.
+   * @returns The last {@link HeaderRowDecision}, or `null` before any successful parse.
    */
   getLastHeaderRowDecision(): HeaderRowDecision | null {
     return this.lastHeaderRowDecision;
   }
 
   /**
-   * Parses rows from an Athena {@link ResultSet}.
+   * Prepares headers, header-row decision, and data-row bounds for parsing.
    *
-   * By default, this method auto-detects and skips the first row when it matches
-   * the headers.
+   * Shared by {@link parseResultSetDetailed} and {@link parseResultSetIter}.
+   * Does not apply {@link ParseResultSetOptions.maxRows}; callers resolve the
+   * emit limit separately.
+   *
+   * When {@link ParserReusePolicy} is `'fresh-each-parse'`, clears prior state
+   * via {@link reset} before preparing.
    *
    * @param resultSet - Athena query result payload, or `undefined`.
-   * @param options - Parsing options (header skipping, duplicate names, column-count mismatch, etc.).
-   * @returns Parsed rows keyed by header name. Returns `[]` when `resultSet` is `undefined`
-   * or has no column metadata.
+   * @param options - Parsing options.
+   * @returns Either an unavailable reason or a ready parse context (headers,
+   * raw rows, data-row start index/count, and header-row decision).
    * @throws Error When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
-   * `Data.length` does not match the header count.
+   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
    */
-  parseResultSet(
+  private prepareParseResultSet(
     resultSet: ResultSet | undefined,
-    options: ParseResultSetOptions = {},
-  ): ParsedRow[] {
-    if (!resultSet) {
-      return [];
+    options: ParseResultSetOptions,
+  ):
+    | { status: 'unavailable'; reason: ParseResultSetUnavailableReason }
+    | {
+      status: 'ready';
+      headers: string[];
+      rawRows: Row[];
+      dataStartIndex: number;
+      dataRowCount: number;
+      decision: HeaderRowDecision;
+    } {
+    if (this.reusePolicy === 'fresh-each-parse') {
+      this.reset();
     }
 
-    // Initialize headers from metadata
+    if (!resultSet) {
+      return { status: 'unavailable', reason: 'result-set-undefined' };
+    }
+
     const meta = resultSet.ResultSetMetadata?.ColumnInfo ?? [];
     this.initHeaders(meta, { duplicateColumnNames: options.duplicateColumnNames });
 
     if (!this.headers) {
-      return [];
+      return { status: 'unavailable', reason: 'headers-unavailable' };
     }
 
+    const headers = this.headers;
     const rawRows = resultSet.Rows ?? [];
     const skipFirstRow = options.skipFirstRow ?? false;
     const skipHeaderRow = options.skipHeaderRow ?? 'auto';
@@ -804,7 +1230,7 @@ export class AthenaQueryResultParser {
         } else {
           const looksLikeHeader = AthenaQueryResultParser.isHeaderRow(
             rawRows[0],
-            this.headers,
+            headers,
           );
           if (!looksLikeHeader) {
             if (mismatchBehavior === 'throw') {
@@ -861,7 +1287,7 @@ export class AthenaQueryResultParser {
             } else {
               const auto = AthenaQueryResultParser.shouldAutoSkipHeaderRow({
                 firstRow: rawRows[0],
-                headers: this.headers,
+                headers,
                 columnInfo: meta,
                 strategy,
               });
@@ -880,18 +1306,205 @@ export class AthenaQueryResultParser {
     }
 
     this.lastHeaderRowDecision = decision;
-    const skipHeader = decision.skipped;
-    const rows = skipHeader ? rawRows.slice(1) : rawRows;
+    const dataStartIndex = decision.skipped ? 1 : 0;
+    const dataRowCount = Math.max(0, rawRows.length - dataStartIndex);
+
+    return {
+      status: 'ready',
+      headers,
+      rawRows,
+      dataStartIndex,
+      dataRowCount,
+      decision,
+    };
+  }
+
+  /**
+   * Parses rows from an Athena {@link ResultSet}.
+   *
+   * By default, this method auto-detects and skips the first row when it matches
+   * the headers.
+   *
+   * When `resultSet` is `undefined` or headers cannot be determined, returns `[]`
+   * unless {@link ParseResultSetOptions.unavailableResultBehavior} is `'throw'`.
+   * Prefer {@link parseResultSetDetailed} when you need to distinguish those
+   * cases from a genuine empty `Rows` array.
+   *
+   * For large result sets, prefer {@link parseResultSetIter} to avoid allocating
+   * a full `ParsedRow[]`, and/or set {@link ParseResultSetOptions.maxRows}.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Parsing options (header skipping, duplicate names, column-count mismatch, etc.).
+   * @returns Parsed rows keyed by header name. Returns `[]` when `resultSet` is `undefined`
+   * or has no column metadata (and headers were not previously initialized).
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * `Data.length` does not match the header count.
+   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * cannot be parsed.
+   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
+   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * `maxRowsExceededBehavior: 'throw'`.
+   */
+  parseResultSet(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParsedRow[] {
+    return this.parseResultSetDetailed(resultSet, options).rows;
+  }
+
+  /**
+   * Parses rows from an Athena {@link ResultSet} and returns diagnostics.
+   *
+   * Same parsing behavior as {@link parseResultSet}, but also exposes why an
+   * empty result occurred via {@link ParseResultSetDiagnostics.unavailableReason}
+   * (`'result-set-undefined'`, `'headers-unavailable'`, or `null` for a genuine
+   * empty `Rows` array), and whether {@link ParseResultSetOptions.maxRows}
+   * truncated the output.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSet}.
+   * @returns A {@link ParseResultSetDetailedResult} with parsed rows and diagnostics.
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * `Data.length` does not match the header count.
+   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * cannot be parsed.
+   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
+   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * `maxRowsExceededBehavior: 'throw'`.
+   */
+  parseResultSetDetailed(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): ParseResultSetDetailedResult {
+    const unavailableBehavior = options.unavailableResultBehavior ?? 'silent';
+
+    const prepared = this.prepareParseResultSet(resultSet, options);
+    if (prepared.status === 'unavailable') {
+      if (unavailableBehavior === 'throw') {
+        throw new Error(
+          AthenaQueryResultParser.describeUnavailableResult(prepared.reason),
+        );
+      }
+
+      return {
+        rows: [],
+        diagnostics: {
+          unavailableReason: prepared.reason,
+          headerRowDecision: null,
+          headers: this.headers,
+          rawRowCount: 0,
+          parsedRowCount: 0,
+          truncatedByMaxRows: false,
+        },
+      };
+    }
+
+    const { emitCount, truncatedByMaxRows } = AthenaQueryResultParser.resolveRowLimit(
+      prepared.dataRowCount,
+      options,
+    );
 
     const columnCountMismatchBehavior =
       options.columnCountMismatchBehavior ?? 'silent';
 
-    return rows.map((row, rowIndex) =>
-      AthenaQueryResultParser.rowToObject(row, this.headers!, {
-        columnCountMismatchBehavior,
-        rowIndex,
-      }),
+    const rows: ParsedRow[] = [];
+    for (let offset = 0; offset < emitCount; offset += 1) {
+      const rawIndex = prepared.dataStartIndex + offset;
+      rows.push(
+        AthenaQueryResultParser.rowToObject(
+          prepared.rawRows[rawIndex],
+          prepared.headers,
+          {
+            columnCountMismatchBehavior,
+            rowIndex: offset,
+          },
+        ),
+      );
+    }
+
+    return {
+      rows,
+      diagnostics: {
+        unavailableReason: null,
+        headerRowDecision: prepared.decision,
+        headers: prepared.headers,
+        rawRowCount: prepared.rawRows.length,
+        parsedRowCount: rows.length,
+        truncatedByMaxRows,
+      },
+    };
+  }
+
+  /**
+   * Lazily parses rows from an Athena {@link ResultSet}.
+   *
+   * Prefer this over {@link parseResultSet} for large pages when you can process
+   * one row at a time, so a full `ParsedRow[]` is not allocated. The underlying
+   * Athena `Rows` array is still held by the `ResultSet` itself.
+   *
+   * Supports the same options as {@link parseResultSet}, including
+   * {@link ParseResultSetOptions.maxRows} and
+   * {@link ParseResultSetOptions.maxRowsExceededBehavior}.
+   *
+   * When parsing is unavailable (`undefined` `ResultSet` or missing headers),
+   * yields nothing unless `unavailableResultBehavior` is `'throw'`.
+   *
+   * @param resultSet - Athena query result payload, or `undefined`.
+   * @param options - Same options as {@link parseResultSet}.
+   * @yields Parsed rows keyed by header name.
+   * @returns Nothing (`void`) when iteration completes or parsing is unavailable.
+   * @throws Error When duplicate column names are detected and
+   * `duplicateColumnNames` is `'throw'` (default).
+   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * `Data.length` does not match the header count.
+   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * cannot be parsed.
+   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
+   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * `maxRowsExceededBehavior: 'throw'`.
+   */
+  *parseResultSetIter(
+    resultSet: ResultSet | undefined,
+    options: ParseResultSetOptions = {},
+  ): Generator<ParsedRow, void, undefined> {
+    const unavailableBehavior = options.unavailableResultBehavior ?? 'silent';
+
+    const prepared = this.prepareParseResultSet(resultSet, options);
+    if (prepared.status === 'unavailable') {
+      if (unavailableBehavior === 'throw') {
+        throw new Error(
+          AthenaQueryResultParser.describeUnavailableResult(prepared.reason),
+        );
+      }
+      return;
+    }
+
+    const { emitCount } = AthenaQueryResultParser.resolveRowLimit(
+      prepared.dataRowCount,
+      options,
     );
+
+    const columnCountMismatchBehavior =
+      options.columnCountMismatchBehavior ?? 'silent';
+
+    for (let offset = 0; offset < emitCount; offset += 1) {
+      const rawIndex = prepared.dataStartIndex + offset;
+      yield AthenaQueryResultParser.rowToObject(
+        prepared.rawRows[rawIndex],
+        prepared.headers,
+        {
+          columnCountMismatchBehavior,
+          rowIndex: offset,
+        },
+      );
+    }
   }
 
   /**
@@ -899,20 +1512,26 @@ export class AthenaQueryResultParser {
    *
    * Any `null` results returned from `rowParser` are filtered out.
    *
+   * Uses {@link parseResultSetIter} internally so a full intermediate
+   * `ParsedRow[]` is not required.
+   *
    * @param resultSet - Athena query result payload, or `undefined`.
    * @param rowParser - Function that transforms each {@link ParsedRow} into `T`, or `null` to skip.
-   * @param options - Same options as {@link parseResultSet} (including `columnCountMismatchBehavior`).
+   * @param options - Same options as {@link parseResultSet} (including
+   * `columnCountMismatchBehavior`, `unavailableResultBehavior`, and `maxRows`).
    * @returns Mapped values with skipped rows removed.
+   * @throws Error When underlying parsing throws (for example, duplicate column
+   * names, column-count mismatch in `'throw'` mode, `unavailableResultBehavior:
+   * 'throw'`, or `maxRowsExceededBehavior: 'throw'`).
    */
   parseResultSetWith<T>(
     resultSet: ResultSet | undefined,
     rowParser: RowParser<T>,
     options: ParseResultSetOptions = {},
   ): T[] {
-    const rows = this.parseResultSet(resultSet, options);
     const results: T[] = [];
 
-    for (const row of rows) {
+    for (const row of this.parseResultSetIter(resultSet, options)) {
       const parsed = rowParser(row);
       if (parsed !== null) {
         results.push(parsed);
@@ -925,7 +1544,13 @@ export class AthenaQueryResultParser {
   /**
    * Resets the parser state (headers, header-row-dropped flag, and last decision).
    *
-   * Call this when reusing a parser instance for a new query.
+   * **Required** before reusing a `'paginate'` instance for a **different**
+   * Athena query. Not needed between pages of the same query (that is what
+   * `'paginate'` is for). Prefer {@link parseResultSetOnce} for one-off parses,
+   * or `{ reusePolicy: 'fresh-each-parse' }` to reset automatically.
+   *
+   * @see hasActiveQueryState
+   * @see ParserReusePolicy
    */
   reset(): void {
     this.headers = null;
@@ -941,10 +1566,18 @@ export class AthenaQueryResultParser {
  * - {@link rowToObject} — convert a single row to a {@link ParsedRow}
  * - {@link rowToTypedObject} — convert a single row to a {@link TypedParsedRow}
  * - {@link isHeaderRow} — detect header-like rows
+ * - {@link parseResultSetOnce} — stateless one-shot parse
+ * - {@link parseResultSetDetailedOnce} — stateless one-shot parse with diagnostics
+ * - {@link parseResultSetIterOnce} — stateless one-shot lazy parse
+ * - {@link parseResultSetWithOnce} — stateless one-shot parse with a row mapper
  */
 export const {
   headersFromMeta,
   rowToObject,
   rowToTypedObject,
   isHeaderRow,
+  parseResultSetOnce,
+  parseResultSetDetailedOnce,
+  parseResultSetIterOnce,
+  parseResultSetWithOnce,
 } = AthenaQueryResultParser;

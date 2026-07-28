@@ -324,6 +324,18 @@ describe('AthenaQueryResultParser', () => {
       });
     });
 
+    it('should record forced decision when skipHeaderRow is true but Rows is empty', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], []);
+      const rows = parser.parseResultSet(resultSet, { skipHeaderRow: true });
+      expect(rows).toEqual([]);
+      expect(parser.getLastHeaderRowDecision()).toEqual({
+        mode: 'forced',
+        skipped: false,
+        reason: 'skipHeaderRow:true',
+      });
+    });
+
     it('should throw by default when skipHeaderRow is true but first row is not a header row', () => {
       const parser = new AthenaQueryResultParser();
       const resultSet = makeResultSet(['id'], [['1'], ['2']]);
@@ -412,6 +424,73 @@ describe('AthenaQueryResultParser', () => {
       });
     });
 
+    it('should isolate each parse when reusePolicy is fresh-each-parse', () => {
+      const parser = new AthenaQueryResultParser({
+        reusePolicy: 'fresh-each-parse',
+      });
+      const resultSet = makeResultSet(
+        ['id'],
+        [
+          ['id'],
+          ['1'],
+        ],
+      );
+      expect(parser.parseResultSet(resultSet)).toEqual([{ id: '1' }]);
+      // Without fresh-each-parse, the second call would keep the header-like row.
+      expect(parser.parseResultSet(resultSet)).toEqual([{ id: '1' }]);
+      expect(parser.getReusePolicy()).toBe('fresh-each-parse');
+    });
+
+    it('should expose active query state for reset guidance', () => {
+      const parser = AthenaQueryResultParser.create();
+      expect(parser.hasActiveQueryState()).toBe(false);
+      parser.parseResultSet(makeResultSet(['id'], [['1']]), {
+        skipHeaderRow: false,
+      });
+      expect(parser.hasActiveQueryState()).toBe(true);
+      parser.reset();
+      expect(parser.hasActiveQueryState()).toBe(false);
+    });
+
+    it('should parse independently via parseResultSetOnce', () => {
+      const resultSet = makeResultSet(
+        ['id'],
+        [
+          ['id'],
+          ['1'],
+        ],
+      );
+      expect(AthenaQueryResultParser.parseResultSetOnce(resultSet)).toEqual([
+        { id: '1' },
+      ]);
+      expect(AthenaQueryResultParser.parseResultSetOnce(resultSet)).toEqual([
+        { id: '1' },
+      ]);
+    });
+
+    it('should support detailed/iter/with once helpers', () => {
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+        ],
+      );
+      const detailed = AthenaQueryResultParser.parseResultSetDetailedOnce(resultSet);
+      expect(detailed.rows).toEqual([{ id: '1', name: 'Alice' }]);
+      expect(detailed.diagnostics.headerRowDecision?.skipped).toBe(true);
+
+      expect([...AthenaQueryResultParser.parseResultSetIterOnce(resultSet)]).toEqual([
+        { id: '1', name: 'Alice' },
+      ]);
+
+      const mapped = AthenaQueryResultParser.parseResultSetWithOnce(
+        resultSet,
+        (row) => row.id,
+      );
+      expect(mapped).toEqual(['1']);
+    });
+
     it('should avoid false-positive header skipping in safe strategy when all columns are varchar', () => {
       const parser = new AthenaQueryResultParser();
       const resultSet = makeResultSet(
@@ -427,6 +506,32 @@ describe('AthenaQueryResultParser', () => {
       });
       expect(rows).toHaveLength(2);
       expect(rows[0]).toEqual({ id: 'id', name: 'name' });
+      expect(parser.getLastHeaderRowDecision()).toEqual({
+        mode: 'auto',
+        skipped: false,
+        strategy: 'safe',
+        reason: 'safe:no-type-evidence',
+      });
+    });
+
+    it('should not skip in safe strategy when complex column types are always parseable', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSetWithTypes(
+        [
+          { name: 'payload', type: 'array' },
+          { name: 'name', type: 'varchar' },
+        ],
+        [
+          ['payload', 'name'],
+          ['[1]', 'Alice'],
+        ],
+      );
+      const rows = parser.parseResultSet(resultSet, {
+        skipHeaderRow: 'auto',
+        headerRowDetectionStrategy: 'safe',
+      });
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({ payload: 'payload', name: 'name' });
       expect(parser.getLastHeaderRowDecision()).toEqual({
         mode: 'auto',
         skipped: false,
@@ -579,6 +684,195 @@ describe('AthenaQueryResultParser', () => {
     it('should return empty array when parseResultSet is given undefined', () => {
       const parser = new AthenaQueryResultParser();
       expect(parser.parseResultSet(undefined)).toEqual([]);
+    });
+
+    it('should expose unavailableReason via parseResultSetDetailed for undefined ResultSet', () => {
+      const parser = new AthenaQueryResultParser();
+      const result = parser.parseResultSetDetailed(undefined);
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics).toEqual({
+        unavailableReason: 'result-set-undefined',
+        headerRowDecision: null,
+        headers: null,
+        rawRowCount: 0,
+        parsedRowCount: 0,
+        truncatedByMaxRows: false,
+      });
+    });
+
+    it('should expose unavailableReason via parseResultSetDetailed when metadata is missing', () => {
+      const parser = new AthenaQueryResultParser();
+      const result = parser.parseResultSetDetailed({ Rows: [makeRow(['1'])] });
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics.unavailableReason).toBe('headers-unavailable');
+      expect(result.diagnostics.headers).toBeNull();
+      expect(result.diagnostics.parsedRowCount).toBe(0);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
+    });
+
+    it('should report null unavailableReason for a genuine empty Rows array', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id', 'name'], []);
+      const result = parser.parseResultSetDetailed(resultSet);
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics.unavailableReason).toBeNull();
+      expect(result.diagnostics.headers).toEqual(['id', 'name']);
+      expect(result.diagnostics.rawRowCount).toBe(0);
+      expect(result.diagnostics.parsedRowCount).toBe(0);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
+      expect(result.diagnostics.headerRowDecision).toEqual({
+        mode: 'auto',
+        skipped: false,
+        strategy: 'exact',
+        reason: 'no-rows',
+      });
+    });
+
+    it('should throw when unavailableResultBehavior is throw and ResultSet is undefined', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() =>
+        parser.parseResultSet(undefined, { unavailableResultBehavior: 'throw' }),
+      ).toThrow('ResultSet is undefined; cannot parse rows.');
+    });
+
+    it('should throw when unavailableResultBehavior is throw and headers are unavailable', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() =>
+        parser.parseResultSet(
+          { Rows: [] },
+          { unavailableResultBehavior: 'throw' },
+        ),
+      ).toThrow(
+        'Headers are unavailable: ResultSet has no ColumnInfo metadata and headers have not been initialized.',
+      );
+    });
+
+    it('should not throw for genuine empty Rows when unavailableResultBehavior is throw', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], []);
+      expect(
+        parser.parseResultSet(resultSet, { unavailableResultBehavior: 'throw' }),
+      ).toEqual([]);
+    });
+
+    it('should include header decision and counts in parseResultSetDetailed diagnostics', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+        ],
+      );
+      const result = parser.parseResultSetDetailed(resultSet);
+      expect(result.rows).toEqual([{ id: '1', name: 'Alice' }]);
+      expect(result.diagnostics.unavailableReason).toBeNull();
+      expect(result.diagnostics.rawRowCount).toBe(2);
+      expect(result.diagnostics.parsedRowCount).toBe(1);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
+      expect(result.diagnostics.headerRowDecision?.skipped).toBe(true);
+    });
+
+    it('should truncate rows when maxRows is set', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3'], ['4']],
+      );
+      const result = parser.parseResultSetDetailed(resultSet, {
+        maxRows: 2,
+        skipHeaderRow: false,
+      });
+      expect(result.rows).toEqual([{ id: '1' }, { id: '2' }]);
+      expect(result.diagnostics.parsedRowCount).toBe(2);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(true);
+    });
+
+    it('should not truncate when row count is within maxRows', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2']],
+      );
+      const result = parser.parseResultSetDetailed(resultSet, {
+        maxRows: 10,
+        skipHeaderRow: false,
+      });
+      expect(result.rows).toEqual([{ id: '1' }, { id: '2' }]);
+      expect(result.diagnostics.parsedRowCount).toBe(2);
+      expect(result.diagnostics.truncatedByMaxRows).toBe(false);
+    });
+
+    it('should throw when maxRows is exceeded and maxRowsExceededBehavior is throw', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3']],
+      );
+      expect(() =>
+        parser.parseResultSet(resultSet, {
+          maxRows: 2,
+          maxRowsExceededBehavior: 'throw',
+          skipHeaderRow: false,
+        }),
+      ).toThrow('Parsed row count (3) exceeds maxRows (2).');
+    });
+
+    it('should reject invalid maxRows values', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], [['1']]);
+      expect(() =>
+        parser.parseResultSet(resultSet, { maxRows: -1, skipHeaderRow: false }),
+      ).toThrow('maxRows must be a non-negative integer when specified.');
+      expect(() =>
+        parser.parseResultSet(resultSet, { maxRows: 1.5, skipHeaderRow: false }),
+      ).toThrow('maxRows must be a non-negative integer when specified.');
+    });
+
+    it('should yield rows lazily via parseResultSetIter', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+          ['2', 'Bob'],
+        ],
+      );
+      const rows = [...parser.parseResultSetIter(resultSet)];
+      expect(rows).toEqual([
+        { id: '1', name: 'Alice' },
+        { id: '2', name: 'Bob' },
+      ]);
+    });
+
+    it('should honor maxRows in parseResultSetIter', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id'],
+        [['1'], ['2'], ['3']],
+      );
+      const rows = [
+        ...parser.parseResultSetIter(resultSet, {
+          maxRows: 2,
+          skipHeaderRow: false,
+        }),
+      ];
+      expect(rows).toEqual([{ id: '1' }, { id: '2' }]);
+    });
+
+    it('should yield nothing from parseResultSetIter for undefined ResultSet', () => {
+      const parser = new AthenaQueryResultParser();
+      expect([...parser.parseResultSetIter(undefined)]).toEqual([]);
+    });
+
+    it('should throw from parseResultSetIter when unavailableResultBehavior is throw', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() => [
+        ...parser.parseResultSetIter(undefined, {
+          unavailableResultBehavior: 'throw',
+        }),
+      ]).toThrow('ResultSet is undefined; cannot parse rows.');
     });
 
     it('should apply custom parser with parseResultSetWith and filter out nulls', () => {
