@@ -581,6 +581,89 @@ describe('AthenaQueryResultParser', () => {
       expect(parser.parseResultSet(undefined)).toEqual([]);
     });
 
+    it('should expose unavailableReason via parseResultSetDetailed for undefined ResultSet', () => {
+      const parser = new AthenaQueryResultParser();
+      const result = parser.parseResultSetDetailed(undefined);
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics).toEqual({
+        unavailableReason: 'result-set-undefined',
+        headerRowDecision: null,
+        headers: null,
+        rawRowCount: 0,
+        parsedRowCount: 0,
+      });
+    });
+
+    it('should expose unavailableReason via parseResultSetDetailed when metadata is missing', () => {
+      const parser = new AthenaQueryResultParser();
+      const result = parser.parseResultSetDetailed({ Rows: [makeRow(['1'])] });
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics.unavailableReason).toBe('headers-unavailable');
+      expect(result.diagnostics.headers).toBeNull();
+      expect(result.diagnostics.parsedRowCount).toBe(0);
+    });
+
+    it('should report null unavailableReason for a genuine empty Rows array', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id', 'name'], []);
+      const result = parser.parseResultSetDetailed(resultSet);
+      expect(result.rows).toEqual([]);
+      expect(result.diagnostics.unavailableReason).toBeNull();
+      expect(result.diagnostics.headers).toEqual(['id', 'name']);
+      expect(result.diagnostics.rawRowCount).toBe(0);
+      expect(result.diagnostics.parsedRowCount).toBe(0);
+      expect(result.diagnostics.headerRowDecision).toEqual({
+        mode: 'auto',
+        skipped: false,
+        strategy: 'exact',
+        reason: 'no-rows',
+      });
+    });
+
+    it('should throw when unavailableResultBehavior is throw and ResultSet is undefined', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() =>
+        parser.parseResultSet(undefined, { unavailableResultBehavior: 'throw' }),
+      ).toThrow('ResultSet is undefined; cannot parse rows.');
+    });
+
+    it('should throw when unavailableResultBehavior is throw and headers are unavailable', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() =>
+        parser.parseResultSet(
+          { Rows: [] },
+          { unavailableResultBehavior: 'throw' },
+        ),
+      ).toThrow(
+        'Headers are unavailable: ResultSet has no ColumnInfo metadata and headers have not been initialized.',
+      );
+    });
+
+    it('should not throw for genuine empty Rows when unavailableResultBehavior is throw', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], []);
+      expect(
+        parser.parseResultSet(resultSet, { unavailableResultBehavior: 'throw' }),
+      ).toEqual([]);
+    });
+
+    it('should include header decision and counts in parseResultSetDetailed diagnostics', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(
+        ['id', 'name'],
+        [
+          ['id', 'name'],
+          ['1', 'Alice'],
+        ],
+      );
+      const result = parser.parseResultSetDetailed(resultSet);
+      expect(result.rows).toEqual([{ id: '1', name: 'Alice' }]);
+      expect(result.diagnostics.unavailableReason).toBeNull();
+      expect(result.diagnostics.rawRowCount).toBe(2);
+      expect(result.diagnostics.parsedRowCount).toBe(1);
+      expect(result.diagnostics.headerRowDecision?.skipped).toBe(true);
+    });
+
     it('should apply custom parser with parseResultSetWith and filter out nulls', () => {
       const parser = new AthenaQueryResultParser();
       const resultSet = makeResultSet(
