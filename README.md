@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/athena-query-result-parser.svg)](https://www.npmjs.com/package/athena-query-result-parser)
 [![license](https://img.shields.io/npm/l/athena-query-result-parser.svg)](https://www.npmjs.com/package/athena-query-result-parser)
 
-A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/) query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It supports metadata-driven headers, configurable header-row skipping, column-count mismatch handling, diagnostics, streaming, row limits, and custom row transformers.
+A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/) query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It supports metadata-driven headers, configurable header-row skipping, column-count mismatch handling, typed parser errors, diagnostics, streaming, row limits, and custom row transformers.
 
 ## Features
 
@@ -12,6 +12,7 @@ A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/)
 - **Robust header auto-detection**: `headerRowDetectionStrategy` (`'exact' | 'safe'`) reduces false positives when using `skipHeaderRow: 'auto'`.
 - **Duplicate column name handling**: `duplicateColumnNames` (`'throw' | 'suffix' | 'allow'`).
 - **Column-count mismatch handling**: `columnCountMismatchBehavior` (`'silent' | 'throw' | 'warn' | 'extra'`).
+- **Typed parser errors**: `AthenaQueryResultParserError` hierarchy with stable `code` values and structured fields for programmatic handling.
 - **Parse diagnostics**: `parseResultSetDetailed()` exposes why a result is empty (`unavailableReason`) and whether `maxRows` truncated output.
 - **Streaming**: `parseResultSetIter()` yields rows lazily without allocating a full `ParsedRow[]`.
 - **Row limits**: `maxRows` / `maxRowsExceededBehavior` cap or reject oversized pages.
@@ -127,6 +128,33 @@ const rows = parser.parseResultSet(resultSet, {
 });
 ```
 
+### Error handling
+
+When a `'throw'` option is triggered, the parser throws a typed subclass of `AthenaQueryResultParserError`. Each error exposes a stable `code` and structured fields for logging or branching:
+
+```typescript
+import {
+  AthenaQueryResultParser,
+  AthenaQueryResultParserError,
+  AthenaQueryResultParserDuplicateColumnNameError,
+  AthenaQueryResultParserColumnCountMismatchError,
+} from 'athena-query-result-parser';
+
+try {
+  AthenaQueryResultParser.parseResultSetOnce(resultSet, {
+    columnCountMismatchBehavior: 'throw',
+  });
+} catch (error) {
+  if (error instanceof AthenaQueryResultParserDuplicateColumnNameError) {
+    console.error(error.code, error.duplicates);
+  } else if (error instanceof AthenaQueryResultParserColumnCountMismatchError) {
+    console.error(error.code, error.expected, error.actual, error.rowIndex);
+  } else if (error instanceof AthenaQueryResultParserError) {
+    console.error(error.code, error.message);
+  }
+}
+```
+
 ### Preserving surplus columns
 
 When a row has more cells than headers, store the extra values under `__extra`:
@@ -229,7 +257,7 @@ new AthenaQueryResultParser({ reusePolicy: 'fresh-each-parse' });
 Control how the parser handles the first row in `Rows`.
 
 - `'auto'` (default): Skip the first row only when it matches the derived headers (once per parser instance in `'paginate'` mode).
-- `true`: Skip the first row **only when it looks like a header row**. By default, this throws if the first row does not look like a header row.
+- `true`: Skip the first row **only when it looks like a header row**. By default, this throws `AthenaQueryResultParserHeaderRowMismatchError` if the first row does not look like a header row.
 - `false`: Never skip the first row.
 
 ```typescript
@@ -254,7 +282,7 @@ parser.parseResultSet(resultSet, { skipFirstRow: true });
 
 Controls what happens when `skipHeaderRow: true` is used but the first row does not look like a header row.
 
-- `'throw'` (default): Throw an error to prevent accidental data loss.
+- `'throw'` (default): Throw `AthenaQueryResultParserHeaderRowMismatchError`.
 - `'keep'`: Keep the first row.
 - `'skip'`: Skip the first row anyway (potentially lossy).
 
@@ -267,7 +295,7 @@ parser.parseResultSet(resultSet, {
 
 ### `duplicateColumnNames`
 
-- `'throw'` (default): Throw an error listing duplicate names.
+- `'throw'` (default): Throw `AthenaQueryResultParserDuplicateColumnNameError`.
 - `'suffix'`: Make names unique (`col`, `col_2`, `col_3`, ...).
 - `'allow'`: Keep duplicates (later columns overwrite earlier ones in `rowToObject`).
 
@@ -278,7 +306,7 @@ parser.parseResultSet(resultSet, { duplicateColumnNames: 'suffix' });
 ### `columnCountMismatchBehavior`
 
 - `'silent'` (default): Pad missing cells with `null` and discard surplus cells.
-- `'throw'`: Throw an error (strict mode).
+- `'throw'`: Throw `AthenaQueryResultParserColumnCountMismatchError` (strict mode).
 - `'warn'`: Emit `console.warn` but keep the `'silent'` value mapping.
 - `'extra'`: Store surplus cells under `__extra` (`EXTRA_COLUMNS_KEY`).
 
@@ -306,7 +334,7 @@ parser.parseResultSet(resultSet, {
 When the `ResultSet` is `undefined` or headers cannot be determined.
 
 - `'silent'` (default): Return `[]` / yield nothing.
-- `'throw'`: Throw an error describing the reason.
+- `'throw'`: Throw `AthenaQueryResultParserUnavailableResultError`.
 
 Does **not** apply when headers are available and `Rows` is simply empty.
 
@@ -318,10 +346,10 @@ parser.parseResultSet(undefined, { unavailableResultBehavior: 'throw' });
 
 Cap how many data rows are returned (after header-row skipping).
 
-- `maxRows`: non-negative integer limit. Omit for no limit.
+- `maxRows`: non-negative integer limit. Omit for no limit. Invalid values throw `AthenaQueryResultParserInvalidMaxRowsError`.
 - `maxRowsExceededBehavior`:
   - `'truncate'` (default): return/yield only the first `maxRows` rows
-  - `'throw'`: throw before producing rows when the data row count exceeds `maxRows`
+  - `'throw'`: throw `AthenaQueryResultParserMaxRowsExceededError` before producing rows when the data row count exceeds `maxRows`
 
 ```typescript
 parser.parseResultSet(resultSet, { maxRows: 1000 });
@@ -347,6 +375,24 @@ parser.parseResultSet(resultSet, {
 - **`AthenaQueryResultParserOptions`**: construction options (`reusePolicy`).
 - **`EXTRA_COLUMNS_KEY`**: `'__extra'`.
 - **`toNumber` / `toBoolean` / `toDate`**: safe conversion helpers.
+
+### Errors
+
+All parser failures extend `AthenaQueryResultParserError`, which provides:
+
+- **`code`**: stable machine-readable identifier
+- **`message`**: human-readable description (unchanged from previous generic `Error` messages)
+
+| Class | `code` | When thrown | Extra fields |
+|-------|--------|-------------|--------------|
+| `AthenaQueryResultParserDuplicateColumnNameError` | `duplicate-column-name` | `duplicateColumnNames: 'throw'` (default) | `duplicates` |
+| `AthenaQueryResultParserColumnCountMismatchError` | `column-count-mismatch` | `columnCountMismatchBehavior: 'throw'` | `expected`, `actual`, `rowIndex?` |
+| `AthenaQueryResultParserUnavailableResultError` | `unavailable-result` | `unavailableResultBehavior: 'throw'` | `reason` (`'result-set-undefined' \| 'headers-unavailable'`) |
+| `AthenaQueryResultParserHeaderRowMismatchError` | `header-row-mismatch` | `skipHeaderRow: true` with non-header first row and `forcedSkipHeaderRowMismatchBehavior: 'throw'` (default) | — |
+| `AthenaQueryResultParserInvalidMaxRowsError` | `invalid-max-rows` | `maxRows` is not a non-negative integer | `maxRows` |
+| `AthenaQueryResultParserMaxRowsExceededError` | `max-rows-exceeded` | `maxRowsExceededBehavior: 'throw'` | `actual`, `maxRows` |
+
+Catch `AthenaQueryResultParserError` to handle every parser failure, or catch a specific subclass for targeted handling.
 
 ### Class: `AthenaQueryResultParser`
 
