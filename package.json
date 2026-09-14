@@ -52,6 +52,14 @@
   "dependencies": {
     "@aws-sdk/client-athena": "^3.983.0"
   },
+  "keywords": [
+    "athena",
+    "aws",
+    "aws-sdk",
+    "parser",
+    "query",
+    "result"
+  ],
   "engines": {
     "node": ">= 20.0.0"
   },
