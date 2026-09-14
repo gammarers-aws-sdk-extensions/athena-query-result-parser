@@ -1,4 +1,22 @@
 import type { Row, ColumnInfo, ResultSet } from '@aws-sdk/client-athena';
+import {
+  AthenaQueryResultParserColumnCountMismatchError,
+  AthenaQueryResultParserDuplicateColumnNameError,
+  AthenaQueryResultParserHeaderRowMismatchError,
+  AthenaQueryResultParserInvalidMaxRowsError,
+  AthenaQueryResultParserMaxRowsExceededError,
+  AthenaQueryResultParserUnavailableResultError,
+} from './errors';
+
+export {
+  AthenaQueryResultParserColumnCountMismatchError,
+  AthenaQueryResultParserDuplicateColumnNameError,
+  AthenaQueryResultParserHeaderRowMismatchError,
+  AthenaQueryResultParserInvalidMaxRowsError,
+  AthenaQueryResultParserMaxRowsExceededError,
+  AthenaQueryResultParserError,
+  AthenaQueryResultParserUnavailableResultError,
+} from './errors';
 
 /**
  * Well-known key on {@link ParsedRow} that holds surplus cell values when
@@ -114,7 +132,7 @@ export type ForcedSkipHeaderRowMismatchBehavior = 'throw' | 'skip' | 'keep';
 /**
  * Behavior when the column names returned by Athena contain duplicates.
  *
- * - `'throw'` (default): throw an Error listing duplicate names
+ * - `'throw'` (default): throw {@link AthenaQueryResultParserDuplicateColumnNameError}
  * - `'suffix'`: rename duplicates like `col`, `col_2`, `col_3`, ...
  * - `'allow'`: keep duplicates (later columns overwrite earlier ones in
  *   {@link AthenaQueryResultParser.rowToObject})
@@ -125,7 +143,7 @@ export type DuplicateColumnNameBehavior = 'throw' | 'suffix' | 'allow';
  * Behavior when `row.Data` length does not match the number of headers.
  *
  * - `'silent'` (default): pad missing cells with `null` and discard surplus cells
- * - `'throw'`: throw an Error (strict mode) to prevent silent data loss
+ * - `'throw'`: throw {@link AthenaQueryResultParserColumnCountMismatchError} (strict mode) to prevent silent data loss
  * - `'warn'`: emit `console.warn` but keep the `'silent'` value mapping
  * - `'extra'`: store surplus cells under {@link EXTRA_COLUMNS_KEY}; short rows are
  *   still padded with `null` (use `'throw'` or `'warn'` to detect them)
@@ -236,7 +254,7 @@ export type ParseResultSetUnavailableReason =
  *
  * - `'silent'` (default): return `[]` (or yield nothing from
  *   {@link AthenaQueryResultParser.parseResultSetIter})
- * - `'throw'`: throw an Error describing the reason
+ * - `'throw'`: throw {@link AthenaQueryResultParserUnavailableResultError}
  *
  * @see ParseResultSetOptions.unavailableResultBehavior
  */
@@ -246,7 +264,7 @@ export type UnavailableResultBehavior = 'silent' | 'throw';
  * Behavior when the number of data rows exceeds {@link ParseResultSetOptions.maxRows}.
  *
  * - `'truncate'` (default): return/yield only the first `maxRows` rows
- * - `'throw'`: throw an Error before producing rows
+ * - `'throw'`: throw {@link AthenaQueryResultParserMaxRowsExceededError} before producing rows
  *
  * Ignored when `maxRows` is omitted.
  *
@@ -370,7 +388,7 @@ export type ParseResultSetOptions = {
   /**
    * Behavior when {@link ColumnInfo.Name} contains duplicates.
    *
-   * - `'throw'` (default): throw an Error listing duplicates
+   * - `'throw'` (default): throw {@link AthenaQueryResultParserDuplicateColumnNameError}
    * - `'suffix'`: rename duplicates like `col`, `col_2`, `col_3`, ...
    * - `'allow'`: keep duplicates (later columns overwrite earlier ones in
    *   {@link AthenaQueryResultParser.rowToObject})
@@ -452,7 +470,7 @@ export class AthenaQueryResultParser {
    * @param columnInfo - Column metadata from the Athena `ResultSet`.
    * @param options - Parser options (for example, duplicate column-name handling).
    * @returns Resolved header names in column order.
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
    */
   static headersFromMeta(
@@ -478,7 +496,7 @@ export class AthenaQueryResultParser {
    * @param headers - Header names derived from metadata (or otherwise).
    * @param options - Row conversion options (for example, column-count mismatch behavior).
    * @returns A {@link ParsedRow} keyed by header name.
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and
    * `row.Data.length` does not equal `headers.length`.
    */
   static rowToObject(
@@ -532,7 +550,7 @@ export class AthenaQueryResultParser {
    * @param columnInfo - Column metadata in the same order as `headers`.
    * @param options - Row conversion options.
    * @returns A {@link TypedParsedRow} keyed by header name.
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and
    * `row.Data.length` does not equal `headers.length`.
    */
   static rowToTypedObject(
@@ -722,57 +740,10 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Builds a human-readable message for a row/header column-count mismatch.
-   *
-   * @param expected - Expected column count (typically `headers.length`).
-   * @param actual - Actual `row.Data` length.
-   * @param rowIndex - Optional zero-based row index for context.
-   * @returns A message suitable for throw/warn.
-   */
-  private static describeColumnCountMismatch(
-    expected: number,
-    actual: number,
-    rowIndex?: number,
-  ): string {
-    const rowPart = rowIndex != null ? ` at row index ${rowIndex}` : '';
-    return `Column count mismatch${rowPart}: expected ${expected} column(s) but row has ${actual}`;
-  }
-
-  /**
-   * Builds a human-readable message for an unavailable parse result.
-   *
-   * @param reason - Why parsing could not proceed.
-   * @returns A message describing the unavailable reason.
-   */
-  private static describeUnavailableResult(
-    reason: ParseResultSetUnavailableReason,
-  ): string {
-    if (reason === 'result-set-undefined') {
-      return 'ResultSet is undefined; cannot parse rows.';
-    }
-
-    return (
-      'Headers are unavailable: ResultSet has no ColumnInfo metadata ' +
-      'and headers have not been initialized.'
-    );
-  }
-
-  /**
-   * Builds a human-readable message when data rows exceed `maxRows`.
-   *
-   * @param actual - Number of data rows after header skipping.
-   * @param maxRows - Configured row limit.
-   * @returns A message suitable for throw.
-   */
-  private static describeMaxRowsExceeded(actual: number, maxRows: number): string {
-    return `Parsed row count (${actual}) exceeds maxRows (${maxRows}).`;
-  }
-
-  /**
    * Validates {@link ParseResultSetOptions.maxRows} when provided.
    *
    * @param maxRows - Optional row limit from options.
-   * @throws Error When `maxRows` is not a non-negative integer.
+   * @throws {@link AthenaQueryResultParserInvalidMaxRowsError} When `maxRows` is not a non-negative integer.
    */
   private static assertValidMaxRows(maxRows: number | undefined): void {
     if (maxRows == null) {
@@ -780,7 +751,7 @@ export class AthenaQueryResultParser {
     }
 
     if (!Number.isInteger(maxRows) || maxRows < 0) {
-      throw new Error('maxRows must be a non-negative integer when specified.');
+      throw new AthenaQueryResultParserInvalidMaxRowsError(maxRows);
     }
   }
 
@@ -790,7 +761,8 @@ export class AthenaQueryResultParser {
    * @param dataRowCount - Number of data rows after header skipping.
    * @param options - Parsing options.
    * @returns The emit limit and whether truncation occurred.
-   * @throws Error When `maxRows` is invalid, or when the count exceeds `maxRows`
+   * @throws {@link AthenaQueryResultParserInvalidMaxRowsError} When `maxRows` is invalid.
+   * @throws {@link AthenaQueryResultParserMaxRowsExceededError} When the count exceeds `maxRows`
    * and `maxRowsExceededBehavior` is `'throw'`.
    */
   private static resolveRowLimit(
@@ -807,9 +779,7 @@ export class AthenaQueryResultParser {
     if (dataRowCount > maxRows) {
       const behavior = options.maxRowsExceededBehavior ?? 'truncate';
       if (behavior === 'throw') {
-        throw new Error(
-          AthenaQueryResultParser.describeMaxRowsExceeded(dataRowCount, maxRows),
-        );
+        throw new AthenaQueryResultParserMaxRowsExceededError(dataRowCount, maxRows);
       }
 
       return { emitCount: maxRows, truncatedByMaxRows: true };
@@ -827,7 +797,7 @@ export class AthenaQueryResultParser {
    * @param actual - Actual `row.Data` length.
    * @param behavior - Mismatch handling strategy.
    * @param rowIndex - Optional zero-based row index for messages.
-   * @throws Error When `behavior` is `'throw'`.
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `behavior` is `'throw'`.
    */
   private static handleColumnCountMismatch(
     expected: number,
@@ -839,18 +809,14 @@ export class AthenaQueryResultParser {
       return;
     }
 
-    const message = AthenaQueryResultParser.describeColumnCountMismatch(
-      expected,
-      actual,
-      rowIndex,
-    );
+    const error = new AthenaQueryResultParserColumnCountMismatchError(expected, actual, rowIndex);
 
     if (behavior === 'throw') {
-      throw new Error(message);
+      throw error;
     }
 
     if (behavior === 'warn') {
-      console.warn(message);
+      console.warn(error.message);
     }
   }
 
@@ -1017,7 +983,7 @@ export class AthenaQueryResultParser {
    * @param headers - Raw header names (may contain duplicates).
    * @param behavior - Duplicate-name handling strategy.
    * @returns Resolved header names.
-   * @throws Error When `behavior` is `'throw'` and duplicates exist.
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When `behavior` is `'throw'` and duplicates exist.
    */
   private static resolveDuplicateHeaders(
     headers: string[],
@@ -1040,9 +1006,7 @@ export class AthenaQueryResultParser {
     }
 
     if (behavior === 'throw') {
-      throw new Error(
-        `Duplicate column names detected: ${duplicates.join(', ')}`,
-      );
+      throw new AthenaQueryResultParserDuplicateColumnNameError(duplicates);
     }
 
     // behavior === 'suffix'
@@ -1122,7 +1086,7 @@ export class AthenaQueryResultParser {
    *
    * @param columnInfo - Column metadata from the Athena `ResultSet`.
    * @param options - Parser options (for example, duplicate column-name handling).
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
    */
   initHeaders(
@@ -1178,9 +1142,9 @@ export class AthenaQueryResultParser {
    * @param options - Parsing options.
    * @returns Either an unavailable reason or a ready parse context (headers,
    * raw rows, data-row start index/count, and header-row decision).
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
-   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * @throws {@link AthenaQueryResultParserHeaderRowMismatchError} When `skipHeaderRow` is `true`, the first row does not look
    * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
    */
   private prepareParseResultSet(
@@ -1234,11 +1198,7 @@ export class AthenaQueryResultParser {
           );
           if (!looksLikeHeader) {
             if (mismatchBehavior === 'throw') {
-              throw new Error(
-                'skipHeaderRow:true was specified but the first row does not look like a header row. ' +
-                'If you want to always drop the first row, use skipFirstRow:true. ' +
-                'Or set forcedSkipHeaderRowMismatchBehavior to "skip" or "keep".',
-              );
+              throw new AthenaQueryResultParserHeaderRowMismatchError();
             }
 
             if (mismatchBehavior === 'keep') {
@@ -1337,15 +1297,16 @@ export class AthenaQueryResultParser {
    * @param options - Parsing options (header skipping, duplicate names, column-count mismatch, etc.).
    * @returns Parsed rows keyed by header name. Returns `[]` when `resultSet` is `undefined`
    * or has no column metadata (and headers were not previously initialized).
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and any row's
    * `Data.length` does not match the header count.
-   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * @throws {@link AthenaQueryResultParserUnavailableResultError} When `unavailableResultBehavior` is `'throw'` and the result
    * cannot be parsed.
-   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * @throws {@link AthenaQueryResultParserHeaderRowMismatchError} When `skipHeaderRow` is `true`, the first row does not look
    * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
-   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * @throws {@link AthenaQueryResultParserInvalidMaxRowsError} When `maxRows` is invalid.
+   * @throws {@link AthenaQueryResultParserMaxRowsExceededError} When data rows exceed `maxRows` with
    * `maxRowsExceededBehavior: 'throw'`.
    */
   parseResultSet(
@@ -1367,15 +1328,16 @@ export class AthenaQueryResultParser {
    * @param resultSet - Athena query result payload, or `undefined`.
    * @param options - Same options as {@link parseResultSet}.
    * @returns A {@link ParseResultSetDetailedResult} with parsed rows and diagnostics.
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and any row's
    * `Data.length` does not match the header count.
-   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * @throws {@link AthenaQueryResultParserUnavailableResultError} When `unavailableResultBehavior` is `'throw'` and the result
    * cannot be parsed.
-   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * @throws {@link AthenaQueryResultParserHeaderRowMismatchError} When `skipHeaderRow` is `true`, the first row does not look
    * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
-   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * @throws {@link AthenaQueryResultParserInvalidMaxRowsError} When `maxRows` is invalid.
+   * @throws {@link AthenaQueryResultParserMaxRowsExceededError} When data rows exceed `maxRows` with
    * `maxRowsExceededBehavior: 'throw'`.
    */
   parseResultSetDetailed(
@@ -1387,9 +1349,7 @@ export class AthenaQueryResultParser {
     const prepared = this.prepareParseResultSet(resultSet, options);
     if (prepared.status === 'unavailable') {
       if (unavailableBehavior === 'throw') {
-        throw new Error(
-          AthenaQueryResultParser.describeUnavailableResult(prepared.reason),
-        );
+        throw new AthenaQueryResultParserUnavailableResultError(prepared.reason);
       }
 
       return {
@@ -1459,15 +1419,16 @@ export class AthenaQueryResultParser {
    * @param options - Same options as {@link parseResultSet}.
    * @yields Parsed rows keyed by header name.
    * @returns Nothing (`void`) when iteration completes or parsing is unavailable.
-   * @throws Error When duplicate column names are detected and
+   * @throws {@link AthenaQueryResultParserDuplicateColumnNameError} When duplicate column names are detected and
    * `duplicateColumnNames` is `'throw'` (default).
-   * @throws Error When `columnCountMismatchBehavior` is `'throw'` and any row's
+   * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and any row's
    * `Data.length` does not match the header count.
-   * @throws Error When `unavailableResultBehavior` is `'throw'` and the result
+   * @throws {@link AthenaQueryResultParserUnavailableResultError} When `unavailableResultBehavior` is `'throw'` and the result
    * cannot be parsed.
-   * @throws Error When `skipHeaderRow` is `true`, the first row does not look
+   * @throws {@link AthenaQueryResultParserHeaderRowMismatchError} When `skipHeaderRow` is `true`, the first row does not look
    * like a header, and `forcedSkipHeaderRowMismatchBehavior` is `'throw'`.
-   * @throws Error When `maxRows` is invalid, or data rows exceed `maxRows` with
+   * @throws {@link AthenaQueryResultParserInvalidMaxRowsError} When `maxRows` is invalid.
+   * @throws {@link AthenaQueryResultParserMaxRowsExceededError} When data rows exceed `maxRows` with
    * `maxRowsExceededBehavior: 'throw'`.
    */
   *parseResultSetIter(
@@ -1479,9 +1440,7 @@ export class AthenaQueryResultParser {
     const prepared = this.prepareParseResultSet(resultSet, options);
     if (prepared.status === 'unavailable') {
       if (unavailableBehavior === 'throw') {
-        throw new Error(
-          AthenaQueryResultParser.describeUnavailableResult(prepared.reason),
-        );
+        throw new AthenaQueryResultParserUnavailableResultError(prepared.reason);
       }
       return;
     }
@@ -1520,7 +1479,7 @@ export class AthenaQueryResultParser {
    * @param options - Same options as {@link parseResultSet} (including
    * `columnCountMismatchBehavior`, `unavailableResultBehavior`, and `maxRows`).
    * @returns Mapped values with skipped rows removed.
-   * @throws Error When underlying parsing throws (for example, duplicate column
+   * @throws {@link AthenaQueryResultParserError} When underlying parsing throws (for example, duplicate column
    * names, column-count mismatch in `'throw'` mode, `unavailableResultBehavior:
    * 'throw'`, or `maxRowsExceededBehavior: 'throw'`).
    */
