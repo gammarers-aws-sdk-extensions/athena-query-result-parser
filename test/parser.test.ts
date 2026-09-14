@@ -1,6 +1,13 @@
 import type { Row, ColumnInfo, ResultSet } from '@aws-sdk/client-athena';
 import {
+  AthenaQueryResultParserColumnCountMismatchError,
+  AthenaQueryResultParserDuplicateColumnNameError,
+  AthenaQueryResultParserHeaderRowMismatchError,
+  AthenaQueryResultParserInvalidMaxRowsError,
+  AthenaQueryResultParserMaxRowsExceededError,
   AthenaQueryResultParser,
+  AthenaQueryResultParserError,
+  AthenaQueryResultParserUnavailableResultError,
   headersFromMeta,
   rowToObject,
   isHeaderRow,
@@ -43,6 +50,109 @@ const makeResultSetWithTypes = (
 };
 
 describe('AthenaQueryResultParser', () => {
+  describe('error hierarchy', () => {
+    it('should throw AthenaQueryResultParserDuplicateColumnNameError with code and duplicates', () => {
+      const columnInfo = makeColumnInfo(['a', 'a', 'b', 'b']);
+      expect(() => headersFromMeta(columnInfo)).toThrow(AthenaQueryResultParserDuplicateColumnNameError);
+      try {
+        headersFromMeta(columnInfo);
+      } catch (error) {
+        expect(error).toBeInstanceOf(AthenaQueryResultParserError);
+        expect(error).toMatchObject({
+          code: 'duplicate-column-name',
+          duplicates: ['a', 'b'],
+        });
+      }
+    });
+
+    it('should throw AthenaQueryResultParserColumnCountMismatchError with code and counts', () => {
+      const row = makeRow(['a']);
+      const headers = ['h1', 'h2'];
+      expect(() =>
+        rowToObject(row, headers, { columnCountMismatchBehavior: 'throw', rowIndex: 2 }),
+      ).toThrow(AthenaQueryResultParserColumnCountMismatchError);
+      try {
+        rowToObject(row, headers, { columnCountMismatchBehavior: 'throw', rowIndex: 2 });
+      } catch (error) {
+        expect(error).toMatchObject({
+          code: 'column-count-mismatch',
+          expected: 2,
+          actual: 1,
+          rowIndex: 2,
+        });
+      }
+    });
+
+    it('should throw AthenaQueryResultParserUnavailableResultError with code and reason', () => {
+      const parser = new AthenaQueryResultParser();
+      expect(() =>
+        parser.parseResultSet(undefined, { unavailableResultBehavior: 'throw' }),
+      ).toThrow(AthenaQueryResultParserUnavailableResultError);
+      try {
+        parser.parseResultSet(undefined, { unavailableResultBehavior: 'throw' });
+      } catch (error) {
+        expect(error).toMatchObject({
+          code: 'unavailable-result',
+          reason: 'result-set-undefined',
+        });
+      }
+    });
+
+    it('should throw AthenaQueryResultParserHeaderRowMismatchError with code', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], [['1'], ['2']]);
+      expect(() => parser.parseResultSet(resultSet, { skipHeaderRow: true })).toThrow(
+        AthenaQueryResultParserHeaderRowMismatchError,
+      );
+      try {
+        parser.parseResultSet(resultSet, { skipHeaderRow: true });
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'header-row-mismatch' });
+      }
+    });
+
+    it('should throw AthenaQueryResultParserInvalidMaxRowsError with code and maxRows', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], [['1']]);
+      expect(() =>
+        parser.parseResultSet(resultSet, { maxRows: -1, skipHeaderRow: false }),
+      ).toThrow(AthenaQueryResultParserInvalidMaxRowsError);
+      try {
+        parser.parseResultSet(resultSet, { maxRows: -1, skipHeaderRow: false });
+      } catch (error) {
+        expect(error).toMatchObject({
+          code: 'invalid-max-rows',
+          maxRows: -1,
+        });
+      }
+    });
+
+    it('should throw AthenaQueryResultParserMaxRowsExceededError with code and counts', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSet(['id'], [['1'], ['2'], ['3']]);
+      expect(() =>
+        parser.parseResultSet(resultSet, {
+          maxRows: 2,
+          maxRowsExceededBehavior: 'throw',
+          skipHeaderRow: false,
+        }),
+      ).toThrow(AthenaQueryResultParserMaxRowsExceededError);
+      try {
+        parser.parseResultSet(resultSet, {
+          maxRows: 2,
+          maxRowsExceededBehavior: 'throw',
+          skipHeaderRow: false,
+        });
+      } catch (error) {
+        expect(error).toMatchObject({
+          code: 'max-rows-exceeded',
+          actual: 3,
+          maxRows: 2,
+        });
+      }
+    });
+  });
+
   describe('value conversion utilities', () => {
     it('toNumber should return null for null/empty/unparseable values', () => {
       expect(toNumber(null)).toBeNull();
