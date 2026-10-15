@@ -6,6 +6,7 @@ import {
   AthenaQueryResultParserInvalidMaxRowsError,
   AthenaQueryResultParserMaxRowsExceededError,
   AthenaQueryResultParserUnavailableResultError,
+  AthenaQueryResultParserUnparseableValueError,
 } from './errors';
 
 export {
@@ -16,6 +17,7 @@ export {
   AthenaQueryResultParserMaxRowsExceededError,
   AthenaQueryResultParserError,
   AthenaQueryResultParserUnavailableResultError,
+  AthenaQueryResultParserUnparseableValueError,
 } from './errors';
 
 /**
@@ -169,16 +171,203 @@ export type RowToObjectOptions = {
 };
 
 /**
+ * Behavior when a cell cannot be converted for its column type.
+ *
+ * - `'keep'` (default): keep the original string value
+ * - `'null'`: replace with `null`
+ * - `'throw'`: throw {@link AthenaQueryResultParserUnparseableValueError}
+ */
+export type UnparseableValueBehavior = 'keep' | 'null' | 'throw';
+
+/**
  * Options for {@link AthenaQueryResultParser.rowToTypedObject}.
  */
 export type RowToTypedObjectOptions = RowToObjectOptions & {
   /**
    * How to handle values that cannot be converted based on the column type.
    *
-   * - `'keep'` (default): keep the original string value
-   * - `'null'`: replace with `null`
+   * Default: `'keep'`.
+   *
+   * @see UnparseableValueBehavior
    */
-  unparseableValueBehavior?: 'keep' | 'null';
+  unparseableValueBehavior?: UnparseableValueBehavior;
+};
+
+/**
+ * Signed integer widths used by Athena (Trino). These fit in a JavaScript
+ * `number` without rounding.
+ */
+const TINYINT_MIN = -128;
+const TINYINT_MAX = 127;
+const SMALLINT_MIN = -32768;
+const SMALLINT_MAX = 32767;
+const INT_MIN = -2147483648;
+const INT_MAX = 2147483647;
+
+/**
+ * Signed 64-bit bounds. Values in this range are not all safe JavaScript
+ * numbers, so `bigint` cells stay decimal text.
+ */
+const BIGINT_MIN = -9223372036854775808n;
+const BIGINT_MAX = 9223372036854775807n;
+
+const SIGNED_INTEGER_PATTERN = /^[+-]?\d+$/;
+const DECIMAL_LITERAL_PATTERN = /^[+-]?(\d+)(?:\.(\d+))?$/;
+const DECIMAL_TYPE_PATTERN = /^decimal(?:\((\d+)(?:\s*,\s*(\d+))?\))?$/;
+
+type SafeIntegerType = 'tinyint' | 'smallint' | 'int' | 'integer';
+
+const SAFE_INTEGER_RANGE: Record<SafeIntegerType, { readonly min: number; readonly max: number }> = {
+  tinyint: { min: TINYINT_MIN, max: TINYINT_MAX },
+  smallint: { min: SMALLINT_MIN, max: SMALLINT_MAX },
+  int: { min: INT_MIN, max: INT_MAX },
+  integer: { min: INT_MIN, max: INT_MAX },
+};
+
+type DecimalBounds = {
+  readonly precision: number | undefined;
+  readonly scale: number | undefined;
+};
+
+const isSafeIntegerType = (type: string): type is SafeIntegerType =>
+  type === 'tinyint' || type === 'smallint' || type === 'int' || type === 'integer';
+
+const isApproximateNumericType = (type: string): boolean =>
+  type === 'real' || type === 'float' || type === 'double';
+
+const isDecimalType = (type: string): boolean =>
+  type === 'decimal' || type.startsWith('decimal(');
+
+const readNonNegativeInteger = (value: number | undefined): number | undefined => {
+  if (value == null) return undefined;
+  if (!Number.isInteger(value) || value < 0) return undefined;
+  return value;
+};
+
+/**
+ * Reads `decimal(precision, scale)` from an Athena type string.
+ *
+ * @param type - Normalized Athena column type.
+ * @returns Bounds found in the type string. Missing groups are `undefined`.
+ */
+const parseDecimalType = (type: string): DecimalBounds | undefined => {
+  const match = DECIMAL_TYPE_PATTERN.exec(type);
+  if (match == null) return undefined;
+
+  const precision = match[1] != null ? Number(match[1]) : undefined;
+  const scale = match[2] != null ? Number(match[2]) : undefined;
+  return { precision, scale };
+};
+
+/**
+ * Prefers `ColumnInfo.Precision` and `ColumnInfo.Scale`.
+ * Falls back to `decimal(p,s)` written on `ColumnInfo.Type`.
+ *
+ * @param column - Column metadata for a decimal cell.
+ * @returns Digit bounds. Either field may be missing.
+ */
+const resolveDecimalBounds = (column: ColumnInfo | undefined): DecimalBounds => {
+  const fromType = parseDecimalType((column?.Type ?? '').trim().toLowerCase());
+  return {
+    precision: readNonNegativeInteger(column?.Precision) ?? fromType?.precision,
+    scale: readNonNegativeInteger(column?.Scale) ?? fromType?.scale,
+  };
+};
+
+const significantIntegerDigits = (integerPart: string): number =>
+  integerPart.replace(/^0+/, '').length;
+
+/**
+ * Converts a safe integer cell to `number` when it fits the Athena type.
+ *
+ * @param value - Raw cell text.
+ * @param type - `tinyint`, `smallint`, `int`, or `integer`.
+ * @returns The integer, or `null` when the text is not in range.
+ */
+const toRangedInteger = (value: string, type: SafeIntegerType): number | null => {
+  const trimmed = value.trim();
+  if (!SIGNED_INTEGER_PATTERN.test(trimmed)) return null;
+
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) return null;
+
+  const range = SAFE_INTEGER_RANGE[type];
+  if (parsed < range.min || parsed > range.max) return null;
+  return parsed;
+};
+
+/**
+ * Keeps a `bigint` cell as decimal text when it fits in signed 64 bits.
+ *
+ * `Number('9223372036854775807')` becomes `9223372036854776000`, so this path
+ * never calls `Number()`.
+ *
+ * @param value - Raw cell text.
+ * @returns Trimmed decimal text, or `null` when it is not a signed 64-bit integer.
+ */
+const toBigIntString = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!SIGNED_INTEGER_PATTERN.test(trimmed)) return null;
+
+  // `BigInt` rejects a leading `+`. The returned text still keeps that sign.
+  const digits = trimmed.startsWith('+') ? trimmed.slice(1) : trimmed;
+  const parsed = BigInt(digits);
+  if (parsed < BIGINT_MIN || parsed > BIGINT_MAX) return null;
+  return trimmed;
+};
+
+/**
+ * Keeps a `decimal` cell as text, including trailing fractional zeros.
+ *
+ * Digit limits use column precision and scale when metadata provides them.
+ * `Number('1.50')` is `1.5`, so this path never calls `Number()`.
+ *
+ * @param value - Raw cell text.
+ * @param column - Column metadata. `Precision` and `Scale` constrain the text.
+ * @returns Trimmed decimal text, or `null` when it does not match the type.
+ */
+const toDecimalString = (value: string, column: ColumnInfo | undefined): string | null => {
+  const trimmed = value.trim();
+  const match = DECIMAL_LITERAL_PATTERN.exec(trimmed);
+  if (match == null) return null;
+
+  const integerPart = match[1] ?? '';
+  const fractionPart = match[2] ?? '';
+  const { precision, scale } = resolveDecimalBounds(column);
+
+  if (precision != null && scale != null && precision < scale) return null;
+  if (scale != null && fractionPart.length > scale) return null;
+
+  if (precision != null && scale != null) {
+    if (significantIntegerDigits(integerPart) > precision - scale) return null;
+    return trimmed;
+  }
+
+  if (precision != null) {
+    if (significantIntegerDigits(integerPart) + fractionPart.length > precision) return null;
+    return trimmed;
+  }
+
+  return trimmed;
+};
+
+const unparseableTypedValue = (
+  value: string,
+  columnName: string,
+  columnType: string | undefined,
+  behavior: UnparseableValueBehavior,
+  rowIndex?: number,
+): AthenaTypedValue => {
+  if (behavior === 'null') return null;
+  if (behavior === 'throw') {
+    throw new AthenaQueryResultParserUnparseableValueError(
+      columnName,
+      columnType,
+      value,
+      rowIndex,
+    );
+  }
+  return value;
 };
 
 /**
@@ -535,15 +724,21 @@ export class AthenaQueryResultParser {
    * Converts an Athena `Row` into a key-value object using the provided headers
    * and column metadata.
    *
-   * Values are converted based on {@link ColumnInfo.Type}:
+   * Values are converted from `ColumnInfo` (`Type`, plus `Precision` and `Scale`
+   * for `decimal`):
    *
-   * - numeric-like types (e.g. `bigint`, `double`, `decimal(...)`) → `number`
+   * - `tinyint`, `smallint`, `int`, and `integer` → `number` when the cell is a
+   *   base-10 integer inside that type's range
+   * - `bigint` → trimmed decimal text when it fits in signed 64 bits. `number`
+   *   would round values above `Number.MAX_SAFE_INTEGER`
+   * - `decimal` → trimmed decimal text, including trailing fractional zeros.
+   *   Digit limits use `Precision` and `Scale`, or `decimal(p,s)` on `Type`
+   * - `real`, `float`, and `double` → `number`
    * - `boolean` → `boolean`
    * - date/time-like types (`date`, `timestamp`, `time`) → `Date`
    * - other/complex types → `string`
    *
-   * Conversion is conservative: when a value cannot be parsed for its type, it
-   * is kept as a `string` by default.
+   * When a value cannot be parsed for its type, it is kept as a `string` by default.
    *
    * @param row - A single Athena result row.
    * @param headers - Header names derived from metadata (or otherwise).
@@ -552,6 +747,8 @@ export class AthenaQueryResultParser {
    * @returns A {@link TypedParsedRow} keyed by header name.
    * @throws {@link AthenaQueryResultParserColumnCountMismatchError} When `columnCountMismatchBehavior` is `'throw'` and
    * `row.Data.length` does not equal `headers.length`.
+   * @throws {@link AthenaQueryResultParserUnparseableValueError} When `unparseableValueBehavior` is `'throw'` and a cell
+   * does not match its column type.
    */
   static rowToTypedObject(
     row: Row,
@@ -575,8 +772,14 @@ export class AthenaQueryResultParser {
 
     for (const [index, header] of headers.entries()) {
       const raw = row.Data?.[index]?.VarCharValue ?? null;
-      const type = columnInfo[index]?.Type;
-      obj[header] = AthenaQueryResultParser.convertTypedValue(raw, type, unparseable);
+      const column = columnInfo[index];
+      obj[header] = AthenaQueryResultParser.convertTypedValue(
+        raw,
+        header,
+        column,
+        unparseable,
+        options.rowIndex,
+      );
     }
 
     if (behavior === 'extra' && actual > expected) {
@@ -702,38 +905,72 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Converts a raw Athena cell string to a typed value based on column type.
+   * Converts a raw Athena cell using column metadata.
+   *
+   * `bigint` and `decimal` stay strings. `Number()` cannot represent every
+   * signed 64-bit integer, and it drops trailing decimal scale.
    *
    * @param value - Raw `VarCharValue` (or `null` when missing).
-   * @param type - Athena column type from metadata.
-   * @param unparseable - Whether to keep the original string or return `null`
-   * when conversion fails.
+   * @param columnName - Header name used when conversion fails.
+   * @param column - Column metadata for this cell.
+   * @param unparseable - Whether to keep the original string, return `null`, or throw.
+   * @param rowIndex - Optional zero-based row index included when throwing.
    * @returns A typed value, or the original string / `null` when unparseable.
+   * @throws {@link AthenaQueryResultParserUnparseableValueError} When `unparseable` is `'throw'` and the cell
+   * does not match its column type.
    */
   private static convertTypedValue(
     value: string | null,
-    type: string | undefined,
-    unparseable: 'keep' | 'null',
+    columnName: string,
+    column: ColumnInfo | undefined,
+    unparseable: UnparseableValueBehavior,
+    rowIndex?: number,
   ): AthenaTypedValue {
     if (value == null) return null;
 
-    const t = AthenaQueryResultParser.normalizeType(type);
-    if (AthenaQueryResultParser.isNumericLikeType(t)) {
-      const n = toNumber(value);
-      if (n != null) return n;
-      return unparseable === 'null' ? null : value;
+    const normalized = AthenaQueryResultParser.normalizeType(column?.Type);
+    const reject = (): AthenaTypedValue => unparseableTypedValue(
+      value,
+      columnName,
+      column?.Type,
+      unparseable,
+      rowIndex,
+    );
+
+    if (isSafeIntegerType(normalized)) {
+      const parsed = toRangedInteger(value, normalized);
+      if (parsed != null) return parsed;
+      return reject();
     }
 
-    if (AthenaQueryResultParser.isBooleanLikeType(t)) {
-      const b = toBoolean(value);
-      if (b != null) return b;
-      return unparseable === 'null' ? null : value;
+    if (normalized === 'bigint') {
+      const parsed = toBigIntString(value);
+      if (parsed != null) return parsed;
+      return reject();
     }
 
-    if (AthenaQueryResultParser.isDateTimeLikeType(t)) {
-      const d = toDate(value);
-      if (d != null) return d;
-      return unparseable === 'null' ? null : value;
+    if (isDecimalType(normalized)) {
+      const parsed = toDecimalString(value, column);
+      if (parsed != null) return parsed;
+      return reject();
+    }
+
+    if (isApproximateNumericType(normalized)) {
+      const parsed = toNumber(value);
+      if (parsed != null) return parsed;
+      return reject();
+    }
+
+    if (AthenaQueryResultParser.isBooleanLikeType(normalized)) {
+      const parsed = toBoolean(value);
+      if (parsed != null) return parsed;
+      return reject();
+    }
+
+    if (AthenaQueryResultParser.isDateTimeLikeType(normalized)) {
+      const parsed = toDate(value);
+      if (parsed != null) return parsed;
+      return reject();
     }
 
     return value;
@@ -847,10 +1084,14 @@ export class AthenaQueryResultParser {
   }
 
   /**
-   * Returns whether the Athena type is treated as a "numeric-like" type.
+   * Returns whether header-row detection should treat the type as numeric.
+   *
+   * This check is looser than {@link rowToTypedObject}. Detection only needs
+   * to know whether a header cell is unlikely to be data. Exact `bigint` and
+   * `decimal` conversion does not use this predicate.
    *
    * @param type - Raw Athena column type from metadata.
-   * @returns `true` for integer/floating/decimal-like types.
+   * @returns `true` for integer, floating, and decimal types.
    */
   private static isNumericLikeType(type: string | undefined): boolean {
     const t = AthenaQueryResultParser.normalizeType(type);

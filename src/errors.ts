@@ -43,6 +43,17 @@ const describeMaxRowsExceeded = (actual: number, maxRows: number): string => {
   return `Parsed row count (${actual}) exceeds maxRows (${maxRows}).`;
 };
 
+const describeUnparseableValue = (
+  columnName: string,
+  columnType: string | undefined,
+  value: string,
+  rowIndex?: number,
+): string => {
+  const rowPart = rowIndex != null ? ` at row index ${rowIndex}` : '';
+  const typePart = columnType != null && columnType.length > 0 ? ` (${columnType})` : '';
+  return `Unparseable value${rowPart} for column "${columnName}"${typePart}: "${value}"`;
+};
+
 const HEADER_ROW_MISMATCH_MESSAGE =
   'skipHeaderRow:true was specified but the first row does not look like a header row. ' +
   'If you want to always drop the first row, use skipFirstRow:true. ' +
@@ -165,5 +176,46 @@ export class AthenaQueryResultParserMaxRowsExceededError extends AthenaQueryResu
     super(describeMaxRowsExceeded(actual, maxRows));
     this.actual = actual;
     this.maxRows = maxRows;
+  }
+}
+
+/**
+ * Thrown when a cell cannot be converted for its column type and
+ * `unparseableValueBehavior` is `'throw'`.
+ */
+export class AthenaQueryResultParserUnparseableValueError extends AthenaQueryResultParserError {
+  readonly code = 'unparseable-value' as const;
+
+  /**
+   * Header name of the cell that could not be converted.
+   */
+  readonly columnName: string;
+
+  /**
+   * Raw Athena column type from metadata, when one was provided.
+   */
+  readonly columnType: string | undefined;
+
+  /**
+   * Original cell text that failed conversion.
+   */
+  readonly value: string;
+
+  /**
+   * Optional zero-based row index included in the message when provided.
+   */
+  readonly rowIndex: number | undefined;
+
+  constructor(
+    columnName: string,
+    columnType: string | undefined,
+    value: string,
+    rowIndex?: number,
+  ) {
+    super(describeUnparseableValue(columnName, columnType, value, rowIndex));
+    this.columnName = columnName;
+    this.columnType = columnType;
+    this.value = value;
+    this.rowIndex = rowIndex;
   }
 }
