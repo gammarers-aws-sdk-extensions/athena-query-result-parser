@@ -8,6 +8,7 @@ import {
   AthenaQueryResultParser,
   AthenaQueryResultParserError,
   AthenaQueryResultParserUnavailableResultError,
+  AthenaQueryResultParserUnparseableValueError,
   headersFromMeta,
   rowToObject,
   isHeaderRow,
@@ -23,8 +24,13 @@ const makeColumnInfo = (names: string[]): ColumnInfo[] =>
   names.map((Name) => ({ Name, Type: 'varchar' }));
 
 const makeColumnInfoWithTypes = (
-  cols: { name: string; type: string }[],
-): ColumnInfo[] => cols.map(({ name, type }) => ({ Name: name, Type: type }));
+  cols: { name: string; type: string; precision?: number; scale?: number }[],
+): ColumnInfo[] => cols.map(({ name, type, precision, scale }) => ({
+  Name: name,
+  Type: type,
+  Precision: precision,
+  Scale: scale,
+}));
 
 const makeRow = (values: (string | null)[]): Row => ({
   Data: values.map((v) => (v != null ? { VarCharValue: v } : {})),
@@ -125,6 +131,32 @@ describe('AthenaQueryResultParser', () => {
           maxRows: -1,
         });
       }
+    });
+
+    it('should throw AthenaQueryResultParserUnparseableValueError with code and cell details', () => {
+      const row = makeRow(['not-a-number']);
+      const headers = ['n'];
+      const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type: 'bigint' }]);
+      const options = { unparseableValueBehavior: 'throw' as const, rowIndex: 4 };
+      expect(() => rowToTypedObject(row, headers, columnInfo, options)).toThrow(
+        AthenaQueryResultParserUnparseableValueError,
+      );
+      try {
+        rowToTypedObject(row, headers, columnInfo, options);
+      } catch (error) {
+        expect(error).toBeInstanceOf(AthenaQueryResultParserError);
+        expect(error).toMatchObject({
+          code: 'unparseable-value',
+          columnName: 'n',
+          columnType: 'bigint',
+          value: 'not-a-number',
+          rowIndex: 4,
+        });
+      }
+
+      const withoutType = new AthenaQueryResultParserUnparseableValueError('n', undefined, 'x');
+      expect(withoutType.message).toBe('Unparseable value for column "n": "x"');
+      expect(withoutType.columnType).toBeUndefined();
     });
 
     it('should throw AthenaQueryResultParserMaxRowsExceededError with code and counts', () => {
@@ -297,11 +329,22 @@ describe('AthenaQueryResultParser', () => {
     });
 
     describe('rowToTypedObject', () => {
-      it('should convert values based on ColumnInfo.Type', () => {
-        const row = makeRow(['1', 'true', '2026-01-01T00:00:00.000Z', 'Alice']);
-        const headers = ['id', 'is_active', 'created_at', 'name'];
+      it('should convert values from ColumnInfo without rounding bigint or decimal', () => {
+        const row = makeRow([
+          '1',
+          '9223372036854775807',
+          '1.50',
+          '1.25',
+          'true',
+          '2026-01-01T00:00:00.000Z',
+          'Alice',
+        ]);
+        const headers = ['id', 'user_id', 'amount', 'score', 'is_active', 'created_at', 'name'];
         const columnInfo = makeColumnInfoWithTypes([
-          { name: 'id', type: 'bigint' },
+          { name: 'id', type: 'integer' },
+          { name: 'user_id', type: 'bigint' },
+          { name: 'amount', type: 'decimal', precision: 10, scale: 2 },
+          { name: 'score', type: 'double' },
           { name: 'is_active', type: 'boolean' },
           { name: 'created_at', type: 'timestamp' },
           { name: 'name', type: 'varchar' },
@@ -309,10 +352,156 @@ describe('AthenaQueryResultParser', () => {
 
         const obj = rowToTypedObject(row, headers, columnInfo);
         expect(obj.id).toBe(1);
+        expect(obj.user_id).toBe('9223372036854775807');
+        expect(obj.amount).toBe('1.50');
+        expect(obj.score).toBe(1.25);
         expect(obj.is_active).toBe(true);
         expect(obj.created_at).toBeInstanceOf(Date);
         expect((obj.created_at as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
         expect(obj.name).toBe('Alice');
+      });
+
+      it.each([
+        ['tinyint', '-128', -128],
+        ['tinyint', '127', 127],
+        ['smallint', '-32768', -32768],
+        ['smallint', '32767', 32767],
+        ['int', '-2147483648', -2147483648],
+        ['int', '2147483647', 2147483647],
+        ['integer', '42', 42],
+      ] as const)('should convert %s %s to number %s', (type, raw, expected) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type }]);
+        expect(rowToTypedObject(row, ['n'], columnInfo)).toEqual({ n: expected });
+      });
+
+      it.each([
+        ['tinyint', '128'],
+        ['tinyint', '-129'],
+        ['smallint', '32768'],
+        ['int', '2147483648'],
+        ['integer', '1.5'],
+        ['integer', '1e2'],
+        ['int', '99999999999999999999'],
+      ] as const)('should keep out-of-range %s value %s', (type, raw) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type }]);
+        expect(rowToTypedObject(row, ['n'], columnInfo)).toEqual({ n: raw });
+      });
+
+      it.each([
+        '1',
+        '+1',
+        '9007199254740993',
+        '9223372036854775807',
+        '-9223372036854775808',
+      ] as const)('should preserve bigint %s as text', (raw) => {
+        const row = makeRow([`  ${raw}  `]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'id', type: 'bigint' }]);
+        expect(rowToTypedObject(row, ['id'], columnInfo)).toEqual({ id: raw });
+      });
+
+      it('should keep a bigint outside signed 64 bits as text by default', () => {
+        const row = makeRow(['9223372036854775808']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'id', type: 'bigint' }]);
+        expect(rowToTypedObject(row, ['id'], columnInfo)).toEqual({ id: '9223372036854775808' });
+      });
+
+      it('should preserve decimal scale from ColumnInfo and from the type string', () => {
+        const fromMetadata = makeColumnInfoWithTypes([
+          { name: 'amount', type: 'decimal', precision: 10, scale: 2 },
+        ]);
+        const fromType = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal(10,2)' }]);
+        const row = makeRow(['1.50']);
+
+        expect(rowToTypedObject(row, ['amount'], fromMetadata)).toEqual({ amount: '1.50' });
+        expect(rowToTypedObject(row, ['amount'], fromType)).toEqual({ amount: '1.50' });
+      });
+
+      it('should keep decimal text when the type string is not decimal(p,s)', () => {
+        const row = makeRow(['1.50']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal(10' }]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: '1.50' });
+      });
+
+      it('should keep a decimal string when precision and scale are absent', () => {
+        const row = makeRow(['1.50']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal' }]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: '1.50' });
+      });
+
+      it('should limit total digits when only precision is present', () => {
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal', precision: 4 }]);
+        expect(rowToTypedObject(makeRow(['12.3']), ['amount'], columnInfo)).toEqual({ amount: '12.3' });
+        expect(rowToTypedObject(makeRow(['1234.5']), ['amount'], columnInfo)).toEqual({ amount: '1234.5' });
+      });
+
+      it('should keep a scale-zero decimal identifier as text', () => {
+        const row = makeRow(['9007199254740993']);
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'id', type: 'decimal', precision: 20, scale: 0 },
+        ]);
+        expect(rowToTypedObject(row, ['id'], columnInfo)).toEqual({ id: '9007199254740993' });
+      });
+
+      it('should reject a decimal when precision is lower than scale', () => {
+        const row = makeRow(['1.00']);
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'amount', type: 'decimal', precision: 2, scale: 4 },
+        ]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: '1.00' });
+      });
+
+      it('should ignore invalid precision and scale and use decimal(p,s) on Type', () => {
+        const row = makeRow(['1.50']);
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'amount', type: 'decimal(10,2)', precision: -1, scale: 1.5 },
+        ]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: '1.50' });
+      });
+
+      it.each([
+        ['double', 'not-a-number'],
+        ['boolean', 'yes'],
+        ['timestamp', 'not-a-date'],
+      ] as const)('should keep unparseable %s value %s', (type, raw) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type }]);
+        expect(rowToTypedObject(row, ['n'], columnInfo)).toEqual({ n: raw });
+      });
+
+      it('should prefer ColumnInfo precision and scale over decimal(p,s) in Type', () => {
+        const row = makeRow(['1.50']);
+        const columnInfo = makeColumnInfoWithTypes([
+          { name: 'amount', type: 'decimal(10,2)', precision: 3, scale: 0 },
+        ]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: '1.50' });
+      });
+
+      it.each([
+        ['999.99', '999.99'],
+        ['1.5', '1.5'],
+        ['0001.50', '0001.50'],
+      ] as const)('should accept decimal %s within decimal(5,2)', (raw, expected) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal(5,2)' }]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: expected });
+      });
+
+      it.each([
+        '1000.00',
+        '1.500',
+        'not-a-decimal',
+      ] as const)('should keep decimal %s that exceeds decimal(5,2)', (raw) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'amount', type: 'decimal(5,2)' }]);
+        expect(rowToTypedObject(row, ['amount'], columnInfo)).toEqual({ amount: raw });
+      });
+
+      it('should keep a null cell as null', () => {
+        const row = makeRow([null]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'id', type: 'bigint' }]);
+        expect(rowToTypedObject(row, ['id'], columnInfo)).toEqual({ id: null });
       });
 
       it('should keep original string when unparseable (default)', () => {
@@ -331,11 +520,22 @@ describe('AthenaQueryResultParser', () => {
         ).toEqual({ n: null });
       });
 
+      it('should throw AthenaQueryResultParserUnparseableValueError when configured', () => {
+        const row = makeRow(['not-a-number']);
+        const headers = ['n'];
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type: 'integer' }]);
+        expect(() =>
+          rowToTypedObject(row, headers, columnInfo, { unparseableValueBehavior: 'throw' }),
+        ).toThrow(
+          'Unparseable value for column "n" (integer): "not-a-number"',
+        );
+      });
+
       it('should store surplus cells under __extra in extra mode', () => {
         const row = makeRow(['1', 'Alice', 'surplus1', 'surplus2']);
         const headers = ['id', 'name'];
         const columnInfo = makeColumnInfoWithTypes([
-          { name: 'id', type: 'bigint' },
+          { name: 'id', type: 'integer' },
           { name: 'name', type: 'varchar' },
         ]);
         expect(
