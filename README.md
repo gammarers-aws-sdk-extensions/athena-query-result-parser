@@ -152,18 +152,26 @@ import {
   AthenaQueryResultParserColumnCountMismatchError,
 } from 'athena-query-result-parser';
 
+const reportParseError = (error: unknown): void => {
+  if (error instanceof AthenaQueryResultParserDuplicateColumnNameError) {
+    console.error(error.code, error.duplicates);
+    return;
+  }
+  if (error instanceof AthenaQueryResultParserColumnCountMismatchError) {
+    console.error(error.code, error.expected, error.actual, error.rowIndex);
+    return;
+  }
+  if (error instanceof AthenaQueryResultParserError) {
+    console.error(error.code, error.message);
+  }
+};
+
 try {
   AthenaQueryResultParser.parseResultSetOnce(resultSet, {
     columnCountMismatchBehavior: 'throw',
   });
 } catch (error) {
-  if (error instanceof AthenaQueryResultParserDuplicateColumnNameError) {
-    console.error(error.code, error.duplicates);
-  } else if (error instanceof AthenaQueryResultParserColumnCountMismatchError) {
-    console.error(error.code, error.expected, error.actual, error.rowIndex);
-  } else if (error instanceof AthenaQueryResultParserError) {
-    console.error(error.code, error.message);
-  }
+  reportParseError(error);
 }
 ```
 
@@ -174,12 +182,11 @@ try {
 | `AthenaQueryResultParserUnavailableResultError` | `unavailable-result` | `unavailableResultBehavior: 'throw'` | `reason` (`'result-set-undefined' \| 'headers-unavailable'`) |
 | `AthenaQueryResultParserHeaderRowMismatchError` | `header-row-mismatch` | `skipHeaderRow: true` with a non-header first row and `forcedSkipHeaderRowMismatchBehavior: 'throw'` (default) | — |
 | `AthenaQueryResultParserInvalidMaxRowsError` | `invalid-max-rows` | `maxRows` is not a non-negative integer | `maxRows` |
+| `AthenaQueryResultParserArgumentError` | `argument` | `timeZone` or `dateValue` cannot be used | — |
 | `AthenaQueryResultParserMaxRowsExceededError` | `max-rows-exceeded` | `maxRowsExceededBehavior: 'throw'` | `actual`, `maxRows` |
 | `AthenaQueryResultParserUnparseableValueError` | `unparseable-value` | `unparseableValueBehavior: 'throw'` | `columnName`, `columnType`, `value`, `rowIndex?` |
 
 Check a subclass before `AthenaQueryResultParserError`. Every parser failure extends that base class and exposes `code`.
-
-An unusable `timeZone` or `dateValue` throws `AthenaQueryResultValueConverterArgumentError` (`code`: `argument`). This package re-exports that class.
 
 ### Preserving surplus columns
 
@@ -312,7 +319,7 @@ Accepted by `parseResultSet`, `parseResultSetDetailed`, `parseResultSetIter`, `p
 | `columnCountMismatchBehavior` | `'silent'` | Same values as on `ParseResultSetOptions`. |
 | `rowIndex` | omitted | Zero-based row index included in throw and warn messages. |
 | `unparseableValueBehavior` | `'keep'` | `'keep'` returns the original string. `'null'` returns `null`. `'throw'` throws `AthenaQueryResultParserUnparseableValueError`. |
-| `timeZone` | `'UTC'` | IANA time zone for a `timestamp` without a zone suffix. `timestamp with time zone` uses the suffix. An unusable name throws `AthenaQueryResultValueConverterArgumentError`. |
+| `timeZone` | `'UTC'` | IANA time zone for a `timestamp` without a zone suffix. `timestamp with time zone` uses the suffix. An unusable name throws `AthenaQueryResultParserArgumentError`. |
 | `dateValue` | `'string'` | `DateValueKind`. `'string'` returns `date` as `YYYY-MM-DD`. `'instant'` returns a UTC-midnight `Date`. |
 
 `tinyint`, `smallint`, `int`, and `integer` become `number` when the cell is a base-10 integer inside that type's range. `bigint` stays a string when it fits in signed 64 bits. `decimal` stays a string, including trailing fractional zeros. Digit limits for `decimal` use `ColumnInfo.Precision` and `ColumnInfo.Scale`, or `decimal(p,s)` on `Type` when those fields are absent. `real`, `float`, and `double` become `number`.

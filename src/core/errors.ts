@@ -138,6 +138,19 @@ export class AthenaQueryResultParserHeaderRowMismatchError extends AthenaQueryRe
 }
 
 /**
+ * Thrown when a caller passes an option this package cannot use.
+ *
+ * This is distinct from a cell that does not match its column type.
+ */
+export class AthenaQueryResultParserArgumentError extends AthenaQueryResultParserError {
+  readonly code = 'argument' as const;
+
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/**
  * Thrown when `maxRows` is provided but is not a
  * non-negative integer.
  */

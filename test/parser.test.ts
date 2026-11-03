@@ -8,8 +8,8 @@ import {
   AthenaQueryResultParser,
   AthenaQueryResultParserError,
   AthenaQueryResultParserUnavailableResultError,
+  AthenaQueryResultParserArgumentError,
   AthenaQueryResultParserUnparseableValueError,
-  AthenaQueryResultValueConverterArgumentError,
   headersFromMeta,
   rowToObject,
   isHeaderRow,
@@ -591,12 +591,18 @@ describe('AthenaQueryResultParser', () => {
         );
       });
 
-      it('should throw AthenaQueryResultValueConverterArgumentError for an unusable time zone', () => {
+      it('should throw AthenaQueryResultParserArgumentError for an unusable time zone', () => {
         const row = makeRow(['2026-01-01 00:00:00.000']);
         const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp' }]);
         expect(() => rowToTypedObject(row, ['created_at'], columnInfo, {
           timeZone: 'Not/AZone',
-        })).toThrow(AthenaQueryResultValueConverterArgumentError);
+        })).toThrow(AthenaQueryResultParserArgumentError);
+        try {
+          rowToTypedObject(row, ['created_at'], columnInfo, { timeZone: 'Not/AZone' });
+        } catch (error) {
+          expect(error).toBeInstanceOf(AthenaQueryResultParserError);
+          expect(error).toMatchObject({ code: 'argument' });
+        }
       });
 
       it('should store surplus cells under __extra in extra mode', () => {

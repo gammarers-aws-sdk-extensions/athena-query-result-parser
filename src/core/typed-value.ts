@@ -8,7 +8,10 @@ import {
   type ToDateOptions,
   type UnparseableValueBehavior,
 } from 'athena-query-result-value-converter';
-import { AthenaQueryResultParserUnparseableValueError } from './errors';
+import {
+  AthenaQueryResultParserArgumentError,
+  AthenaQueryResultParserUnparseableValueError,
+} from './errors';
 
 export type {
   AthenaTypedValue,
@@ -16,8 +19,6 @@ export type {
   ToDateOptions,
   UnparseableValueBehavior,
 };
-
-export { AthenaQueryResultValueConverterArgumentError };
 
 /**
  * `date` columns stay calendar text. A UTC-midnight `Date` shifts the day in zones behind UTC.
@@ -55,7 +56,7 @@ export const toBoolean = AthenaQueryResultValueConverter.toBoolean;
  * @param value - Raw text, or `null`.
  * @param options - Session time zone for a timestamp that has no suffix.
  * @returns A {@link Date}, or `null` when the text is not a representable Athena literal.
- * @throws {@link AthenaQueryResultValueConverterArgumentError} When `options.timeZone` is not an IANA time zone.
+ * @throws {@link AthenaQueryResultParserArgumentError} When `options.timeZone` is not an IANA time zone.
  */
 export const toDate = AthenaQueryResultValueConverter.toDate;
 
@@ -119,7 +120,7 @@ export type ConvertTypedValueOptions = {
  * @returns A typed value, or the original string / `null` when unparseable.
  * @throws {@link AthenaQueryResultParserUnparseableValueError} When `unparseableValueBehavior` is `'throw'`
  * and the cell does not match its column type.
- * @throws {@link AthenaQueryResultValueConverterArgumentError} When `timeZone` or `dateValue` is unusable.
+ * @throws {@link AthenaQueryResultParserArgumentError} When `timeZone` or `dateValue` is unusable.
  */
 export const convertTypedValue = (
   value: string | null,
@@ -136,14 +137,17 @@ export const convertTypedValue = (
       dateValue: options.dateValue ?? DEFAULT_DATE_VALUE,
     });
   } catch (error) {
-    if (!(error instanceof AthenaQueryResultValueConverterUnparseableValueError)) {
-      throw error;
+    if (error instanceof AthenaQueryResultValueConverterUnparseableValueError) {
+      throw new AthenaQueryResultParserUnparseableValueError(
+        error.columnName,
+        error.columnType,
+        error.value,
+        error.rowIndex,
+      );
     }
-    throw new AthenaQueryResultParserUnparseableValueError(
-      error.columnName,
-      error.columnType,
-      error.value,
-      error.rowIndex,
-    );
+    if (error instanceof AthenaQueryResultValueConverterArgumentError) {
+      throw new AthenaQueryResultParserArgumentError(error.message);
+    }
+    throw error;
   }
 };

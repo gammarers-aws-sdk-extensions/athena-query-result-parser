@@ -129,7 +129,7 @@ export type RowToTypedObjectOptions = RowToObjectOptions & {
    *
    * Default: `'UTC'`. `timestamp with time zone` uses the suffix on the cell.
    * `YYYY-MM-DD HH:mm:ss.SSS` is that zone's wall clock, not the host zone.
-   * An unusable name throws `AthenaQueryResultValueConverterArgumentError`.
+   * An unusable name throws {@link AthenaQueryResultParserArgumentError}.
    */
   timeZone?: string;
   /**
@@ -528,7 +528,7 @@ export class AthenaQueryResultParser {
    * `row.Data.length` does not equal `headers.length`.
    * @throws {@link AthenaQueryResultParserUnparseableValueError} When `unparseableValueBehavior` is `'throw'` and a cell
    * does not match its column type.
-   * @throws {@link AthenaQueryResultValueConverterArgumentError} When `timeZone` or `dateValue` is unusable.
+   * @throws {@link AthenaQueryResultParserArgumentError} When `timeZone` or `dateValue` is unusable.
    */
   static rowToTypedObject(
     row: Row,

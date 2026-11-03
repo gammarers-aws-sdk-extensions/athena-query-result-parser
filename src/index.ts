@@ -1,4 +1,5 @@
 export {
+  AthenaQueryResultParserArgumentError,
   AthenaQueryResultParserColumnCountMismatchError,
   AthenaQueryResultParserDuplicateColumnNameError,
   AthenaQueryResultParserHeaderRowMismatchError,
@@ -10,7 +11,6 @@ export {
 } from './core/errors';
 
 export {
-  AthenaQueryResultValueConverterArgumentError,
   toNumber,
   toBoolean,
   toDate,
