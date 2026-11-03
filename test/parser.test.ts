@@ -1,4 +1,5 @@
 import type { Row, ColumnInfo, ResultSet } from '@aws-sdk/client-athena';
+import { AthenaQueryResultValueConverter } from 'athena-query-result-value-converter';
 import {
   AthenaQueryResultParserColumnCountMismatchError,
   AthenaQueryResultParserDuplicateColumnNameError,
@@ -240,6 +241,21 @@ describe('AthenaQueryResultParser', () => {
     it('toDate should throw AthenaQueryResultParserArgumentError for an unusable time zone', () => {
       expect(() => toDate('2026-01-01 00:00:00.000', { timeZone: 'Not/AZone' }))
         .toThrow(AthenaQueryResultParserArgumentError);
+    });
+
+    it('should rethrow an unexpected converter failure', () => {
+      const unexpected = new Error('converter failed');
+      const convert = jest.spyOn(AthenaQueryResultValueConverter, 'convert').mockImplementation(() => {
+        throw unexpected;
+      });
+      const row = makeRow(['1']);
+      const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type: 'integer' }]);
+
+      try {
+        expect(() => rowToTypedObject(row, ['n'], columnInfo)).toThrow(unexpected);
+      } finally {
+        convert.mockRestore();
+      }
     });
   });
 
@@ -548,10 +564,38 @@ describe('AthenaQueryResultParser', () => {
       });
 
       it.each([
+        ['double', 'Infinity', Number.POSITIVE_INFINITY],
+        ['double', '-Infinity', Number.NEGATIVE_INFINITY],
+        ['double', '+Infinity', Number.POSITIVE_INFINITY],
+        ['float', '  Infinity  ', Number.POSITIVE_INFINITY],
+        ['real', 'NaN', Number.NaN],
+      ] as const)('should convert non-finite %s %s to a number', (type, raw, expected) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type }]);
+        const converted = rowToTypedObject(row, ['n'], columnInfo, {
+          unparseableValueBehavior: 'throw',
+        }).n;
+        expect(typeof converted).toBe('number');
+        expect(Object.is(converted, expected)).toBe(true);
+      });
+
+      it.each([
+        ['double', 'nan'],
+        ['double', 'infinity'],
+        ['integer', 'Infinity'],
+        ['varchar', 'NaN'],
+      ] as const)('should keep %s value %s that is not an Athena non-finite literal', (type, raw) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'n', type }]);
+        expect(rowToTypedObject(row, ['n'], columnInfo)).toEqual({ n: raw });
+      });
+
+      it.each([
         ['timestamp with time zone', '2026-01-01 00:00:00.000 America/Los_Angeles', new Date('2026-01-01T08:00:00.000Z')],
         ['time', '12:34:56.789', '12:34:56.789'],
         ['date', '2026-01-01', '2026-01-01'],
         ['timestamp(6)', '2026-01-01 00:00:00.123456', '2026-01-01 00:00:00.123456'],
+        ['timestamp(6)', '2026-01-01 00:00:00.123', '2026-01-01 00:00:00.123'],
         ['timestamp(6) with time zone', '2026-01-01 00:00:00.123456 America/Los_Angeles', '2026-01-01 00:00:00.123456 America/Los_Angeles'],
       ] as const)('should convert %s literal %s with an explicit temporal parser', (type, raw, expected) => {
         const row = makeRow([raw]);
@@ -563,6 +607,51 @@ describe('AthenaQueryResultParser', () => {
           return;
         }
         expect(converted).toBe(expected);
+      });
+
+      it.each([
+        ['timestamp', '2026-01-01 00:00:00.000 UTC', '2026-01-01T00:00:00.000Z'],
+        ['timestamp', '2026-01-01 00:00:00 UTC', '2026-01-01T00:00:00.000Z'],
+        ['timestamp(0)', '2026-01-01 00:00:00.000', '2026-01-01T00:00:00.000Z'],
+        ['timestamp', '2026-01-01', '2026-01-01T00:00:00.000Z'],
+      ] as const)('should convert timestamp %s value %s when toDate can read it', (type, raw, iso) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type }]);
+        const converted = rowToTypedObject(row, ['created_at'], columnInfo, {
+          unparseableValueBehavior: 'throw',
+        }).created_at;
+        expect(converted).toBeInstanceOf(Date);
+        expect((converted as Date).toISOString()).toBe(iso);
+      });
+
+      it('should let a zone suffix win over the session time zone', () => {
+        const row = makeRow(['2026-01-01 00:00:00.000 UTC']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp' }]);
+        const converted = rowToTypedObject(row, ['created_at'], columnInfo, {
+          timeZone: 'Asia/Tokyo',
+        }).created_at;
+        expect((converted as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
+      });
+
+      it('should interpret an extra zero fraction in the session time zone', () => {
+        const row = makeRow(['2026-01-01 00:00:00.0']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp(0)' }]);
+        const converted = rowToTypedObject(row, ['created_at'], columnInfo, {
+          timeZone: 'Asia/Tokyo',
+          unparseableValueBehavior: 'null',
+        }).created_at;
+        expect((converted as Date).toISOString()).toBe('2025-12-31T15:00:00.000Z');
+      });
+
+      it.each([
+        ['timestamp with time zone', '2026-01-01 00:00:00.000+00:00'],
+        ['date', '2026-01-01 00:00:00.000'],
+        ['time', '12:34:56.1234'],
+        ['timestamp(6)', '2026-01-01 00:00:00.1234567'],
+      ] as const)('should keep %s value %s that toDate cannot represent', (type, raw) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'value', type }]);
+        expect(rowToTypedObject(row, ['value'], columnInfo)).toEqual({ value: raw });
       });
 
       it('should interpret a zone-less timestamp in the given time zone', () => {
@@ -901,6 +990,50 @@ describe('AthenaQueryResultParser', () => {
         strategy: 'safe',
         reason: 'safe:no-type-evidence',
       });
+    });
+
+    it('should not skip a non-finite double that matches its header', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSetWithTypes(
+        [{ name: 'Infinity', type: 'double' }],
+        [
+          ['Infinity'],
+          ['1.5'],
+        ],
+      );
+      const rows = parser.parseResultSet(resultSet, {
+        skipHeaderRow: 'auto',
+        headerRowDetectionStrategy: 'safe',
+      });
+      expect(rows).toEqual([
+        { Infinity: 'Infinity' },
+        { Infinity: '1.5' },
+      ]);
+      expect(parser.getLastHeaderRowDecision()).toEqual({
+        mode: 'auto',
+        skipped: false,
+        strategy: 'safe',
+        reason: 'safe:no-type-evidence',
+      });
+    });
+
+    it('should not skip a zoned timestamp literal that matches its header', () => {
+      const parser = new AthenaQueryResultParser();
+      const literal = '2026-01-01 00:00:00.000 UTC';
+      const resultSet = makeResultSetWithTypes(
+        [{ name: literal, type: 'timestamp' }],
+        [
+          [literal],
+          ['2026-02-01 00:00:00.000'],
+        ],
+      );
+      const rows = parser.parseResultSet(resultSet, {
+        skipHeaderRow: 'auto',
+        headerRowDetectionStrategy: 'safe',
+      });
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({ [literal]: literal });
+      expect(parser.getLastHeaderRowDecision()?.skipped).toBe(false);
     });
 
     it('should not skip in safe strategy when complex column types are always parseable', () => {

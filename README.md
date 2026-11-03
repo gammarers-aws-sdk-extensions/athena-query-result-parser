@@ -22,7 +22,7 @@ A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/)
 - **Stateful pagination**: Instance parsers retain headers / header-row-dropped state across pages of one query; use `reset()`, `reusePolicy: 'fresh-each-parse'`, or `*Once` to avoid cross-query misuse.
 - **Custom row parsing**: `parseResultSetWith<T>()` transforms each row; rows that return `null` are filtered out.
 - **Value conversion helpers**: `toNumber`, `toBoolean`, and `toDate` for `string | null` values.
-- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals and temporal types). `bigint`, `decimal`, and `time` stay strings. `date` stays `YYYY-MM-DD` text. A `timestamp` becomes a `Date` when its precision fits in milliseconds, and keeps finer text as written.
+- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals and temporal types). `bigint`, `decimal`, and `time` stay strings. `date` stays `YYYY-MM-DD` text. `real`, `float`, and `double` become numbers, including `Infinity`, `-Infinity`, and `NaN`. A `timestamp` becomes a `Date` when its precision fits in milliseconds, and keeps finer text as written. A zone suffix is applied even when the column type omits `with time zone`.
 - **Static helpers**: `headersFromMeta`, `rowToObject`, `isHeaderRow`, and the `*Once` helpers are exported for use without managing instance lifecycle.
 
 ## Installation
@@ -234,9 +234,10 @@ const typed = rowToTypedObject(row, headers, columnInfo);
 // integer / tinyint / smallint → number
 // bigint → string (exact decimal text, including values above Number.MAX_SAFE_INTEGER)
 // decimal → string (trailing scale kept; Precision and Scale come from ColumnInfo)
-// double / float → number, boolean → boolean
+// double / float / real → number, including Infinity, -Infinity, and NaN; boolean → boolean
 // date → 'YYYY-MM-DD'
 // timestamp / timestamp(p) / timestamp with time zone → Date when precision is milliseconds or coarser
+// a zone suffix on a zone-less timestamp is still a Date
 // time / time(p) → time text
 
 const zoned = rowToTypedObject(row, headers, columnInfo, {

@@ -506,12 +506,14 @@ export class AthenaQueryResultParser {
    *   would round values above `Number.MAX_SAFE_INTEGER`
    * - `decimal` → trimmed decimal text, including trailing fractional zeros.
    *   Digit limits use `Precision` and `Scale`, or `decimal(p,s)` on `Type`
-   * - `real`, `float`, and `double` → `number`
+   * - `real`, `float`, and `double` → `number`, including `Infinity`, `-Infinity`, and `NaN`
    * - `boolean` → `boolean`
    * - `date` → `YYYY-MM-DD` text by default (`dateValue: 'instant'` returns a UTC-midnight {@link Date})
    * - `timestamp`, `timestamp(p)`, and `timestamp with time zone` → {@link Date} when the
    *   declared precision is at most milliseconds. A zone suffix, including an IANA name,
-   *   selects the instant. Precision above milliseconds stays the original text
+   *   selects the instant, including when the column type itself has no zone. A timestamp
+   *   the value converter rejects is still a {@link Date} when `toDate` can read it.
+   *   Precision above milliseconds stays the original text
    * - `time` and `time(p)` → the time text. A time has no date, so it is not a {@link Date}
    * - other/complex types → `string`
    *
