@@ -347,7 +347,8 @@
             "ts-jest",
             "ts-node",
             "typescript",
-            "@aws-sdk/client-athena"
+            "@aws-sdk/client-athena",
+            "athena-query-result-value-converter"
           ]
         },
         {

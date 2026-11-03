@@ -22,7 +22,7 @@ A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/)
 - **Stateful pagination**: Instance parsers retain headers / header-row-dropped state across pages of one query; use `reset()`, `reusePolicy: 'fresh-each-parse'`, or `*Once` to avoid cross-query misuse.
 - **Custom row parsing**: `parseResultSetWith<T>()` transforms each row; rows that return `null` are filtered out.
 - **Value conversion helpers**: `toNumber`, `toBoolean`, and `toDate` for `string | null` values.
-- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals). `bigint` and `decimal` stay strings so large integers and trailing scale are preserved.
+- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals and temporal types). `bigint`, `decimal`, and `time` stay strings. `date` stays `YYYY-MM-DD` text. `real`, `float`, and `double` become numbers, including `Infinity`, `-Infinity`, and `NaN`. A `timestamp` becomes a `Date` when its precision fits in milliseconds, and keeps finer text as written. A zone suffix is applied even when the column type omits `with time zone`.
 - **Static helpers**: `headersFromMeta`, `rowToObject`, `isHeaderRow`, and the `*Once` helpers are exported for use without managing instance lifecycle.
 
 ## Installation
@@ -54,18 +54,27 @@ pnpm add athena-query-result-parser
 Prefer the stateless `*Once` helpers when you have a single `ResultSet`:
 
 ```typescript
-import { AthenaQueryResultParser, parseResultSetOnce } from 'athena-query-result-parser';
+import { parseResultSetOnce } from 'athena-query-result-parser';
 import type { ResultSet } from '@aws-sdk/client-athena';
 
-const resultSet: ResultSet = getAthenaResultSet(); // from GetQueryResults, etc.
+const resultSet: ResultSet = {
+  ResultSetMetadata: {
+    ColumnInfo: [
+      { Name: 'id', Type: 'varchar' },
+      { Name: 'name', Type: 'varchar' },
+    ],
+  },
+  Rows: [
+    { Data: [{ VarCharValue: 'id' }, { VarCharValue: 'name' }] },
+    { Data: [{ VarCharValue: '1' }, { VarCharValue: 'Alice' }] },
+  ],
+};
 
 const rows = parseResultSetOnce(resultSet);
-// rows: Array<Record<string, string | null>>
-// e.g. [{ id: '1', name: 'Alice' }, { id: '2', name: 'Bob' }]
-
-// Equivalent:
-// AthenaQueryResultParser.parseResultSetOnce(resultSet);
+// [{ id: '1', name: 'Alice' }]
 ```
+
+`AthenaQueryResultParser.parseResultSetOnce(resultSet)` is the same call.
 
 ### Paginate pages of one query
 
@@ -152,18 +161,26 @@ import {
   AthenaQueryResultParserColumnCountMismatchError,
 } from 'athena-query-result-parser';
 
+const reportParseError = (error: unknown): void => {
+  if (error instanceof AthenaQueryResultParserDuplicateColumnNameError) {
+    console.error(error.code, error.duplicates);
+    return;
+  }
+  if (error instanceof AthenaQueryResultParserColumnCountMismatchError) {
+    console.error(error.code, error.expected, error.actual, error.rowIndex);
+    return;
+  }
+  if (error instanceof AthenaQueryResultParserError) {
+    console.error(error.code, error.message);
+  }
+};
+
 try {
   AthenaQueryResultParser.parseResultSetOnce(resultSet, {
     columnCountMismatchBehavior: 'throw',
   });
 } catch (error) {
-  if (error instanceof AthenaQueryResultParserDuplicateColumnNameError) {
-    console.error(error.code, error.duplicates);
-  } else if (error instanceof AthenaQueryResultParserColumnCountMismatchError) {
-    console.error(error.code, error.expected, error.actual, error.rowIndex);
-  } else if (error instanceof AthenaQueryResultParserError) {
-    console.error(error.code, error.message);
-  }
+  reportParseError(error);
 }
 ```
 
@@ -174,6 +191,7 @@ try {
 | `AthenaQueryResultParserUnavailableResultError` | `unavailable-result` | `unavailableResultBehavior: 'throw'` | `reason` (`'result-set-undefined' \| 'headers-unavailable'`) |
 | `AthenaQueryResultParserHeaderRowMismatchError` | `header-row-mismatch` | `skipHeaderRow: true` with a non-header first row and `forcedSkipHeaderRowMismatchBehavior: 'throw'` (default) | — |
 | `AthenaQueryResultParserInvalidMaxRowsError` | `invalid-max-rows` | `maxRows` is not a non-negative integer | `maxRows` |
+| `AthenaQueryResultParserArgumentError` | `argument` | `timeZone` or `dateValue` cannot be used | — |
 | `AthenaQueryResultParserMaxRowsExceededError` | `max-rows-exceeded` | `maxRowsExceededBehavior: 'throw'` | `actual`, `maxRows` |
 | `AthenaQueryResultParserUnparseableValueError` | `unparseable-value` | `unparseableValueBehavior: 'throw'` | `columnName`, `columnType`, `value`, `rowIndex?` |
 
@@ -201,8 +219,10 @@ import { toNumber, toBoolean, toDate } from 'athena-query-result-parser';
 
 const n = toNumber(row.count);        // number | null
 const b = toBoolean(row.is_active);   // boolean | null
-const d = toDate(row.created_at);     // Date | null
+const d = toDate('2026-01-01 00:00:00.000'); // Date → 2026-01-01T00:00:00.000Z
 ```
+
+`toDate(value, options)` takes `ToDateOptions`. It accepts an Athena timestamp literal or `YYYY-MM-DD`. A zone suffix on the timestamp wins. A timestamp without a suffix uses `timeZone` (default `UTC`). An unusable name throws `AthenaQueryResultParserArgumentError`. ISO `T` / `Z` text returns `null`.
 
 ### Type-aware row conversion (ColumnInfo.Type based)
 
@@ -214,7 +234,16 @@ const typed = rowToTypedObject(row, headers, columnInfo);
 // integer / tinyint / smallint → number
 // bigint → string (exact decimal text, including values above Number.MAX_SAFE_INTEGER)
 // decimal → string (trailing scale kept; Precision and Scale come from ColumnInfo)
-// double / float → number, boolean → boolean, timestamp → Date
+// double / float / real → number, including Infinity, -Infinity, and NaN; boolean → boolean
+// date → 'YYYY-MM-DD'
+// timestamp / timestamp(p) / timestamp with time zone → Date when precision is milliseconds or coarser
+// a zone suffix on a zone-less timestamp is still a Date
+// time / time(p) → time text
+
+const zoned = rowToTypedObject(row, headers, columnInfo, {
+  timeZone: 'Asia/Tokyo',
+  dateValue: 'instant',
+});
 
 const typedStrict = rowToTypedObject(row, headers, columnInfo, {
   unparseableValueBehavior: 'throw',
@@ -273,7 +302,7 @@ Passed to `new AthenaQueryResultParser({ ... })` or `AthenaQueryResultParser.cre
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `reusePolicy` | `'paginate'` | `'paginate'` keeps headers and the header-row-dropped flag across pages of one query. `'fresh-each-parse'` calls `reset()` before every parse. |
+| `reusePolicy` | `'paginate'` | `ParserReusePolicy`. `'paginate'` keeps headers and the header-row-dropped flag across pages of one query. `'fresh-each-parse'` calls `reset()` before every parse. |
 
 ### `ParseResultSetOptions`
 
@@ -281,27 +310,31 @@ Accepted by `parseResultSet`, `parseResultSetDetailed`, `parseResultSetIter`, `p
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `skipHeaderRow` | `'auto'` | `'auto'` skips the first row only when it matches the headers, once per instance in `'paginate'` mode. `true` skips it only when it looks like a header, and throws `AthenaQueryResultParserHeaderRowMismatchError` when it does not. `false` never skips it. |
+| `skipHeaderRow` | `'auto'` | `SkipHeaderRowOption`. `'auto'` skips the first row only when it matches the headers, once per instance in `'paginate'` mode. `true` skips it only when it looks like a header, and throws `AthenaQueryResultParserHeaderRowMismatchError` when it does not. `false` never skips it. |
 | `skipFirstRow` | `false` | Drops the first row unconditionally. |
-| `forcedSkipHeaderRowMismatchBehavior` | `'throw'` | Used when `skipHeaderRow` is `true` and the first row is not a header. `'throw'` throws `AthenaQueryResultParserHeaderRowMismatchError`. `'keep'` keeps the row. `'skip'` drops it. |
-| `duplicateColumnNames` | `'throw'` | `'throw'` throws `AthenaQueryResultParserDuplicateColumnNameError`. `'suffix'` renames duplicates (`col`, `col_2`, `col_3`, ...). `'allow'` keeps duplicates; later columns overwrite earlier ones in `rowToObject`. |
-| `headerRowDetectionStrategy` | `'exact'` | Used when `skipHeaderRow` is `'auto'`. `'exact'` skips on an exact header match. `'safe'` also requires type evidence that the row is unlikely to be data. |
-| `columnCountMismatchBehavior` | `'silent'` | `'silent'` pads missing cells with `null` and drops surplus cells. `'throw'` throws `AthenaQueryResultParserColumnCountMismatchError`. `'warn'` logs `console.warn` and uses the `'silent'` mapping. `'extra'` stores surplus cells under `__extra`. |
-| `unavailableResultBehavior` | `'silent'` | When `ResultSet` is `undefined` or headers cannot be determined. `'silent'` returns `[]` or yields nothing. `'throw'` throws `AthenaQueryResultParserUnavailableResultError`. Does not apply when headers exist and `Rows` is empty. |
+| `forcedSkipHeaderRowMismatchBehavior` | `'throw'` | `ForcedSkipHeaderRowMismatchBehavior`. Used when `skipHeaderRow` is `true` and the first row is not a header. `'throw'` throws `AthenaQueryResultParserHeaderRowMismatchError`. `'keep'` keeps the row. `'skip'` drops it. |
+| `duplicateColumnNames` | `'throw'` | `DuplicateColumnNameBehavior`. `'throw'` throws `AthenaQueryResultParserDuplicateColumnNameError`. `'suffix'` renames duplicates (`col`, `col_2`, `col_3`, ...). `'allow'` keeps duplicates; later columns overwrite earlier ones in `rowToObject`. |
+| `headerRowDetectionStrategy` | `'exact'` | `HeaderRowDetectionStrategy`. Used when `skipHeaderRow` is `'auto'`. `'exact'` skips on an exact header match. `'safe'` also requires type evidence that the row is unlikely to be data. |
+| `columnCountMismatchBehavior` | `'silent'` | `ColumnCountMismatchBehavior`. `'silent'` pads missing cells with `null` and drops surplus cells. `'throw'` throws `AthenaQueryResultParserColumnCountMismatchError`. `'warn'` logs `console.warn` and uses the `'silent'` mapping. `'extra'` stores surplus cells under `__extra`. |
+| `unavailableResultBehavior` | `'silent'` | `UnavailableResultBehavior`. When `ResultSet` is `undefined` or headers cannot be determined. `'silent'` returns `[]` or yields nothing. `'throw'` throws `AthenaQueryResultParserUnavailableResultError`. Does not apply when headers exist and `Rows` is empty. |
 | `maxRows` | omitted | Non-negative integer cap on data rows after header skipping. Omit for no limit. Invalid values throw `AthenaQueryResultParserInvalidMaxRowsError`. |
-| `maxRowsExceededBehavior` | `'truncate'` | `'truncate'` returns or yields the first `maxRows` rows. `'throw'` throws `AthenaQueryResultParserMaxRowsExceededError` before producing rows. Ignored when `maxRows` is omitted. |
+| `maxRowsExceededBehavior` | `'truncate'` | `MaxRowsExceededBehavior`. `'truncate'` returns or yields the first `maxRows` rows. `'throw'` throws `AthenaQueryResultParserMaxRowsExceededError` before producing rows. Ignored when `maxRows` is omitted. |
 
 ### Row helpers
 
-`columnCountMismatchBehavior` and `rowIndex` apply to `rowToObject` and `rowToTypedObject`. `unparseableValueBehavior` applies to `rowToTypedObject`.
+`RowToObjectOptions` supplies `columnCountMismatchBehavior` and `rowIndex`. `RowToTypedObjectOptions` adds the remaining options in this table. `toDate` takes `ToDateOptions`, which has `timeZone` only.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `columnCountMismatchBehavior` | `'silent'` | Same values as on `ParseResultSetOptions`. |
+| `columnCountMismatchBehavior` | `'silent'` | `ColumnCountMismatchBehavior`. Same values as on `ParseResultSetOptions`. |
 | `rowIndex` | omitted | Zero-based row index included in throw and warn messages. |
-| `unparseableValueBehavior` | `'keep'` | `'keep'` returns the original string. `'null'` returns `null`. `'throw'` throws `AthenaQueryResultParserUnparseableValueError`. |
+| `unparseableValueBehavior` | `'keep'` | `UnparseableValueBehavior`. `'keep'` returns the original string. `'null'` returns `null`. `'throw'` throws `AthenaQueryResultParserUnparseableValueError`. Applies to `rowToTypedObject`. |
+| `timeZone` | `'UTC'` | IANA time zone for a `timestamp` without a zone suffix. `timestamp with time zone` uses the suffix. An unusable name throws `AthenaQueryResultParserArgumentError`. Applies to `rowToTypedObject` and `toDate`. |
+| `dateValue` | `'string'` | `DateValueKind`. `'string'` returns `date` as `YYYY-MM-DD`. `'instant'` returns a UTC-midnight `Date`. Applies to `rowToTypedObject`. |
 
 `tinyint`, `smallint`, `int`, and `integer` become `number` when the cell is a base-10 integer inside that type's range. `bigint` stays a string when it fits in signed 64 bits. `decimal` stays a string, including trailing fractional zeros. Digit limits for `decimal` use `ColumnInfo.Precision` and `ColumnInfo.Scale`, or `decimal(p,s)` on `Type` when those fields are absent. `real`, `float`, and `double` become `number`.
+
+`timestamp`, `timestamp(p)`, and the `with time zone` forms accept Athena literals such as `2026-01-01 00:00:00.000` and `2026-01-01 00:00:00.000 America/Los_Angeles`. Precision comes from `ColumnInfo.Precision`, then `(p)`, then 3. Precision above 3 stays the original text, including the zone suffix, so fractional digits are not cut down to milliseconds. `time` and `time(p)` stay text. `date` accepts `YYYY-MM-DD` only.
 
 ## Requirements
 

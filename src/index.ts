@@ -1,4 +1,5 @@
 export {
+  AthenaQueryResultParserArgumentError,
   AthenaQueryResultParserColumnCountMismatchError,
   AthenaQueryResultParserDuplicateColumnNameError,
   AthenaQueryResultParserHeaderRowMismatchError,
@@ -17,6 +18,8 @@ export {
 
 export type {
   AthenaTypedValue,
+  DateValueKind,
+  ToDateOptions,
   UnparseableValueBehavior,
 } from './core/typed-value';
 

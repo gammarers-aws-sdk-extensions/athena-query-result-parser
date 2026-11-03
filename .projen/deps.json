@@ -2,7 +2,7 @@
   "dependencies": [
     {
       "name": "@gammarers/projen-projects",
-      "version": "^0.5.8",
+      "version": "^0.6.3",
       "type": "build"
     },
     {
@@ -81,6 +81,11 @@
     {
       "name": "@aws-sdk/client-athena",
       "version": "^3.983.0",
+      "type": "runtime"
+    },
+    {
+      "name": "athena-query-result-value-converter",
+      "version": "^0.2.0",
       "type": "runtime"
     }
   ],
