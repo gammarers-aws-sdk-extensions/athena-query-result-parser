@@ -47,6 +47,28 @@ export const toNumber = AthenaQueryResultValueConverter.toNumber;
 export const toBoolean = AthenaQueryResultValueConverter.toBoolean;
 
 /**
+ * Maps a converter failure onto this package's error hierarchy.
+ *
+ * @param error - The error caught from the value converter.
+ * @throws {@link AthenaQueryResultParserUnparseableValueError} When the converter rejected a cell.
+ * @throws {@link AthenaQueryResultParserArgumentError} When the converter rejected an option.
+ */
+const rethrowConverterError = (error: unknown): never => {
+  if (error instanceof AthenaQueryResultValueConverterUnparseableValueError) {
+    throw new AthenaQueryResultParserUnparseableValueError(
+      error.columnName,
+      error.columnType,
+      error.value,
+      error.rowIndex,
+    );
+  }
+  if (error instanceof AthenaQueryResultValueConverterArgumentError) {
+    throw new AthenaQueryResultParserArgumentError(error.message);
+  }
+  throw error;
+};
+
+/**
  * Converts an Athena timestamp or `YYYY-MM-DD` date to a {@link Date}.
  *
  * Accepts `YYYY-MM-DD HH:mm:ss[.SSS]` and the same form with a `UTC`, numeric-offset,
@@ -54,11 +76,17 @@ export const toBoolean = AthenaQueryResultValueConverter.toBoolean;
  * returns `null`.
  *
  * @param value - Raw text, or `null`.
- * @param options - Session time zone for a timestamp that has no suffix.
+ * @param options - {@link ToDateOptions}. Session time zone for a timestamp that has no suffix.
  * @returns A {@link Date}, or `null` when the text is not a representable Athena literal.
  * @throws {@link AthenaQueryResultParserArgumentError} When `options.timeZone` is not an IANA time zone.
  */
-export const toDate = AthenaQueryResultValueConverter.toDate;
+export const toDate = (value: string | null, options?: ToDateOptions): Date | null => {
+  try {
+    return AthenaQueryResultValueConverter.toDate(value, options);
+  } catch (error) {
+    return rethrowConverterError(error);
+  }
+};
 
 /**
  * Returns whether the Athena type is treated as a string-like type.
@@ -137,17 +165,6 @@ export const convertTypedValue = (
       dateValue: options.dateValue ?? DEFAULT_DATE_VALUE,
     });
   } catch (error) {
-    if (error instanceof AthenaQueryResultValueConverterUnparseableValueError) {
-      throw new AthenaQueryResultParserUnparseableValueError(
-        error.columnName,
-        error.columnType,
-        error.value,
-        error.rowIndex,
-      );
-    }
-    if (error instanceof AthenaQueryResultValueConverterArgumentError) {
-      throw new AthenaQueryResultParserArgumentError(error.message);
-    }
-    throw error;
+    return rethrowConverterError(error);
   }
 };

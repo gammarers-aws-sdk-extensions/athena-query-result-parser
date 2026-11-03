@@ -236,6 +236,11 @@ describe('AthenaQueryResultParser', () => {
     it('toDate should return null for ISO T/Z text', () => {
       expect(toDate('2026-01-01T00:00:00.000Z')).toBeNull();
     });
+
+    it('toDate should throw AthenaQueryResultParserArgumentError for an unusable time zone', () => {
+      expect(() => toDate('2026-01-01 00:00:00.000', { timeZone: 'Not/AZone' }))
+        .toThrow(AthenaQueryResultParserArgumentError);
+    });
   });
 
   describe('static methods', () => {

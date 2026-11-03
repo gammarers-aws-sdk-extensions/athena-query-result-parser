@@ -2,7 +2,7 @@ import { ProjenTypeScriptProject } from '@gammarers/projen-projects';
 const project = new ProjenTypeScriptProject({
   name: 'athena-query-result-parser',
   repositoryUrl: 'https://github.com/gammarers-aws-sdk-extensions/athena-query-result-parser.git',
-  description: 'A small TypeScript library that parses Amazon Athena query result `ResultSet` objects (from `@aws-sdk/client-athena`) into header-based row objects. It handles metadata-driven headers, skips the header row when present, and supports custom row transformers.',
+  description: 'A TypeScript library that parses Amazon Athena query result ResultSet objects from @aws-sdk/client-athena into header-based row objects, with header-row handling, column-count mismatch behavior, typed errors, diagnostics, streaming, row limits, and custom row transformers.',
   keywords: [
     'athena',
     'query',
