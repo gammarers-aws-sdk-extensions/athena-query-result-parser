@@ -10,6 +10,7 @@ export {
 } from './core/errors';
 
 export {
+  AthenaQueryResultValueConverterArgumentError,
   toNumber,
   toBoolean,
   toDate,
@@ -17,6 +18,8 @@ export {
 
 export type {
   AthenaTypedValue,
+  DateValueKind,
+  ToDateOptions,
   UnparseableValueBehavior,
 } from './core/typed-value';
 

@@ -13,6 +13,7 @@ const project = new ProjenTypeScriptProject({
   ],
   deps: [
     '@aws-sdk/client-athena@^3.983.0',
+    'athena-query-result-value-converter@^0.2.0',
   ],
   devDeps: [
     '@gammarers/projen-projects@^0.5.8',

@@ -51,7 +51,8 @@
     "typescript": "6.0.x"
   },
   "dependencies": {
-    "@aws-sdk/client-athena": "^3.983.0"
+    "@aws-sdk/client-athena": "^3.983.0",
+    "athena-query-result-value-converter": "^0.2.0"
   },
   "keywords": [
     "athena",

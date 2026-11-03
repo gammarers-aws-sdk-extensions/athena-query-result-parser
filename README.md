@@ -22,7 +22,7 @@ A TypeScript library that parses [Amazon Athena](https://aws.amazon.com/athena/)
 - **Stateful pagination**: Instance parsers retain headers / header-row-dropped state across pages of one query; use `reset()`, `reusePolicy: 'fresh-each-parse'`, or `*Once` to avoid cross-query misuse.
 - **Custom row parsing**: `parseResultSetWith<T>()` transforms each row; rows that return `null` are filtered out.
 - **Value conversion helpers**: `toNumber`, `toBoolean`, and `toDate` for `string | null` values.
-- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals). `bigint` and `decimal` stay strings so large integers and trailing scale are preserved.
+- **Type-aware row conversion**: `rowToTypedObject` converts cells from `ColumnInfo` (`Type`, and `Precision` / `Scale` for decimals and temporal types). `bigint`, `decimal`, and `time` stay strings. `date` stays `YYYY-MM-DD` text. A `timestamp` becomes a `Date` when its precision fits in milliseconds, and keeps finer text as written.
 - **Static helpers**: `headersFromMeta`, `rowToObject`, `isHeaderRow`, and the `*Once` helpers are exported for use without managing instance lifecycle.
 
 ## Installation
@@ -179,6 +179,8 @@ try {
 
 Check a subclass before `AthenaQueryResultParserError`. Every parser failure extends that base class and exposes `code`.
 
+An unusable `timeZone` or `dateValue` throws `AthenaQueryResultValueConverterArgumentError` (`code`: `argument`). This package re-exports that class.
+
 ### Preserving surplus columns
 
 When a row has more cells than headers, store the extra values under `__extra`:
@@ -201,8 +203,10 @@ import { toNumber, toBoolean, toDate } from 'athena-query-result-parser';
 
 const n = toNumber(row.count);        // number | null
 const b = toBoolean(row.is_active);   // boolean | null
-const d = toDate(row.created_at);     // Date | null
+const d = toDate('2026-01-01 00:00:00.000'); // Date → 2026-01-01T00:00:00.000Z
 ```
+
+`toDate` accepts an Athena timestamp literal or `YYYY-MM-DD`. A zone suffix on the timestamp wins. A timestamp without a suffix uses `timeZone` (default `UTC`). ISO `T` / `Z` text returns `null`.
 
 ### Type-aware row conversion (ColumnInfo.Type based)
 
@@ -214,7 +218,15 @@ const typed = rowToTypedObject(row, headers, columnInfo);
 // integer / tinyint / smallint → number
 // bigint → string (exact decimal text, including values above Number.MAX_SAFE_INTEGER)
 // decimal → string (trailing scale kept; Precision and Scale come from ColumnInfo)
-// double / float → number, boolean → boolean, timestamp → Date
+// double / float → number, boolean → boolean
+// date → 'YYYY-MM-DD'
+// timestamp / timestamp(p) / timestamp with time zone → Date when precision is milliseconds or coarser
+// time / time(p) → time text
+
+const zoned = rowToTypedObject(row, headers, columnInfo, {
+  timeZone: 'Asia/Tokyo',
+  dateValue: 'instant',
+});
 
 const typedStrict = rowToTypedObject(row, headers, columnInfo, {
   unparseableValueBehavior: 'throw',
@@ -300,8 +312,12 @@ Accepted by `parseResultSet`, `parseResultSetDetailed`, `parseResultSetIter`, `p
 | `columnCountMismatchBehavior` | `'silent'` | Same values as on `ParseResultSetOptions`. |
 | `rowIndex` | omitted | Zero-based row index included in throw and warn messages. |
 | `unparseableValueBehavior` | `'keep'` | `'keep'` returns the original string. `'null'` returns `null`. `'throw'` throws `AthenaQueryResultParserUnparseableValueError`. |
+| `timeZone` | `'UTC'` | IANA time zone for a `timestamp` without a zone suffix. `timestamp with time zone` uses the suffix. An unusable name throws `AthenaQueryResultValueConverterArgumentError`. |
+| `dateValue` | `'string'` | `DateValueKind`. `'string'` returns `date` as `YYYY-MM-DD`. `'instant'` returns a UTC-midnight `Date`. |
 
 `tinyint`, `smallint`, `int`, and `integer` become `number` when the cell is a base-10 integer inside that type's range. `bigint` stays a string when it fits in signed 64 bits. `decimal` stays a string, including trailing fractional zeros. Digit limits for `decimal` use `ColumnInfo.Precision` and `ColumnInfo.Scale`, or `decimal(p,s)` on `Type` when those fields are absent. `real`, `float`, and `double` become `number`.
+
+`timestamp`, `timestamp(p)`, and the `with time zone` forms accept Athena literals such as `2026-01-01 00:00:00.000` and `2026-01-01 00:00:00.000 America/Los_Angeles`. Precision comes from `ColumnInfo.Precision`, then `(p)`, then 3. Precision above 3 stays the original text, including the zone suffix, so fractional digits are not cut down to milliseconds. `time` and `time(p)` stay text. `date` accepts `YYYY-MM-DD` only.
 
 ## Requirements
 

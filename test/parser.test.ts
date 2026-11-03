@@ -9,6 +9,7 @@ import {
   AthenaQueryResultParserError,
   AthenaQueryResultParserUnavailableResultError,
   AthenaQueryResultParserUnparseableValueError,
+  AthenaQueryResultValueConverterArgumentError,
   headersFromMeta,
   rowToObject,
   isHeaderRow,
@@ -220,10 +221,20 @@ describe('AthenaQueryResultParser', () => {
       expect(toDate('not-a-date')).toBeNull();
     });
 
-    it('toDate should parse ISO-like timestamps', () => {
-      const d = toDate('2026-01-01T00:00:00.000Z');
+    it('toDate should parse Athena timestamp literals', () => {
+      const d = toDate('2026-01-01 00:00:00.000');
       expect(d).not.toBeNull();
       expect(d!.toISOString()).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    it('toDate should apply a named zone suffix', () => {
+      const d = toDate('2026-01-01 00:00:00.000 America/Los_Angeles');
+      expect(d).not.toBeNull();
+      expect(d!.toISOString()).toBe('2026-01-01T08:00:00.000Z');
+    });
+
+    it('toDate should return null for ISO T/Z text', () => {
+      expect(toDate('2026-01-01T00:00:00.000Z')).toBeNull();
     });
   });
 
@@ -336,7 +347,7 @@ describe('AthenaQueryResultParser', () => {
           '1.50',
           '1.25',
           'true',
-          '2026-01-01T00:00:00.000Z',
+          '2026-01-01 00:00:00.000',
           'Alice',
         ]);
         const headers = ['id', 'user_id', 'amount', 'score', 'is_active', 'created_at', 'name'];
@@ -529,6 +540,63 @@ describe('AthenaQueryResultParser', () => {
         ).toThrow(
           'Unparseable value for column "n" (integer): "not-a-number"',
         );
+      });
+
+      it.each([
+        ['timestamp with time zone', '2026-01-01 00:00:00.000 America/Los_Angeles', new Date('2026-01-01T08:00:00.000Z')],
+        ['time', '12:34:56.789', '12:34:56.789'],
+        ['date', '2026-01-01', '2026-01-01'],
+        ['timestamp(6)', '2026-01-01 00:00:00.123456', '2026-01-01 00:00:00.123456'],
+        ['timestamp(6) with time zone', '2026-01-01 00:00:00.123456 America/Los_Angeles', '2026-01-01 00:00:00.123456 America/Los_Angeles'],
+      ] as const)('should convert %s literal %s with an explicit temporal parser', (type, raw, expected) => {
+        const row = makeRow([raw]);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'value', type }]);
+        const converted = rowToTypedObject(row, ['value'], columnInfo).value;
+        if (expected instanceof Date) {
+          expect(converted).toBeInstanceOf(Date);
+          expect((converted as Date).toISOString()).toBe(expected.toISOString());
+          return;
+        }
+        expect(converted).toBe(expected);
+      });
+
+      it('should interpret a zone-less timestamp in the given time zone', () => {
+        const row = makeRow(['2026-01-01 00:00:00.000']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp' }]);
+        const converted = rowToTypedObject(row, ['created_at'], columnInfo, {
+          timeZone: 'Asia/Tokyo',
+        }).created_at;
+        expect(converted).toBeInstanceOf(Date);
+        expect((converted as Date).toISOString()).toBe('2025-12-31T15:00:00.000Z');
+      });
+
+      it('should return a UTC-midnight Date when dateValue is instant', () => {
+        const row = makeRow(['2026-01-01']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'birth_date', type: 'date' }]);
+        const converted = rowToTypedObject(row, ['birth_date'], columnInfo, {
+          dateValue: 'instant',
+        }).birth_date;
+        expect(converted).toBeInstanceOf(Date);
+        expect((converted as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
+      });
+
+      it('should throw the parser unparseable error for a timestamp(6) that is not a literal', () => {
+        const row = makeRow(['not-a-timestamp']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp(6)' }]);
+        expect(() => rowToTypedObject(row, ['created_at'], columnInfo, {
+          unparseableValueBehavior: 'throw',
+          rowIndex: 2,
+        })).toThrow(
+          'Unparseable value at row index 2 for column "created_at" (timestamp(6)): "not-a-timestamp"',
+        );
+      });
+
+      it('should throw AthenaQueryResultValueConverterArgumentError for an unusable time zone', () => {
+        const row = makeRow(['2026-01-01 00:00:00.000']);
+        const columnInfo = makeColumnInfoWithTypes([{ name: 'created_at', type: 'timestamp' }]);
+        expect(() => rowToTypedObject(row, ['created_at'], columnInfo, {
+          timeZone: 'Not/AZone',
+        })).toThrow(AthenaQueryResultValueConverterArgumentError);
       });
 
       it('should store surplus cells under __extra in extra mode', () => {
@@ -899,6 +967,29 @@ describe('AthenaQueryResultParser', () => {
         skipped: true,
         strategy: 'safe',
         reason: 'safe:type-evidence',
+      });
+    });
+
+    it('should skip header row in safe strategy for timestamp(6) type evidence', () => {
+      const parser = new AthenaQueryResultParser();
+      const resultSet = makeResultSetWithTypes(
+        [
+          { name: 'created_at', type: 'timestamp(6)' },
+          { name: 'name', type: 'varchar' },
+        ],
+        [
+          ['created_at', 'name'],
+          ['2026-01-01 00:00:00.123456', 'Alice'],
+        ],
+      );
+      const rows = parser.parseResultSet(resultSet, {
+        skipHeaderRow: 'auto',
+        headerRowDetectionStrategy: 'safe',
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual({
+        created_at: '2026-01-01 00:00:00.123456',
+        name: 'Alice',
       });
     });
 

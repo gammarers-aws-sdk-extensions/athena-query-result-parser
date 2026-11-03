@@ -9,9 +9,11 @@ import {
 } from './core/errors';
 import {
   convertTypedValue,
+  DEFAULT_DATE_VALUE,
   isParseableAsType,
   isStringLikeType,
   type AthenaTypedValue,
+  type DateValueKind,
   type UnparseableValueBehavior,
 } from './core/typed-value';
 
@@ -122,6 +124,23 @@ export type RowToTypedObjectOptions = RowToObjectOptions & {
    * @see UnparseableValueBehavior
    */
   unparseableValueBehavior?: UnparseableValueBehavior;
+  /**
+   * IANA time zone for a `timestamp` that has no zone suffix.
+   *
+   * Default: `'UTC'`. `timestamp with time zone` uses the suffix on the cell.
+   * `YYYY-MM-DD HH:mm:ss.SSS` is that zone's wall clock, not the host zone.
+   * An unusable name throws `AthenaQueryResultValueConverterArgumentError`.
+   */
+  timeZone?: string;
+  /**
+   * How to return a `date` column.
+   *
+   * Default: `'string'` ({@link DEFAULT_DATE_VALUE}), the `YYYY-MM-DD` text.
+   * `'instant'` returns a UTC-midnight {@link Date}.
+   *
+   * @see DateValueKind
+   */
+  dateValue?: DateValueKind;
 };
 
 /**
@@ -489,10 +508,16 @@ export class AthenaQueryResultParser {
    *   Digit limits use `Precision` and `Scale`, or `decimal(p,s)` on `Type`
    * - `real`, `float`, and `double` → `number`
    * - `boolean` → `boolean`
-   * - date/time-like types (`date`, `timestamp`, `time`) → `Date`
+   * - `date` → `YYYY-MM-DD` text by default (`dateValue: 'instant'` returns a UTC-midnight {@link Date})
+   * - `timestamp`, `timestamp(p)`, and `timestamp with time zone` → {@link Date} when the
+   *   declared precision is at most milliseconds. A zone suffix, including an IANA name,
+   *   selects the instant. Precision above milliseconds stays the original text
+   * - `time` and `time(p)` → the time text. A time has no date, so it is not a {@link Date}
    * - other/complex types → `string`
    *
-   * When a value cannot be parsed for its type, it is kept as a `string` by default.
+   * Timestamp text is an Athena literal (`YYYY-MM-DD HH:mm:ss.SSS`, optional zone suffix),
+   * not a value for `Date.parse`. When a value cannot be parsed for its type, it is kept
+   * as a `string` by default.
    *
    * @param row - A single Athena result row.
    * @param headers - Header names derived from metadata (or otherwise).
@@ -503,6 +528,7 @@ export class AthenaQueryResultParser {
    * `row.Data.length` does not equal `headers.length`.
    * @throws {@link AthenaQueryResultParserUnparseableValueError} When `unparseableValueBehavior` is `'throw'` and a cell
    * does not match its column type.
+   * @throws {@link AthenaQueryResultValueConverterArgumentError} When `timeZone` or `dateValue` is unusable.
    */
   static rowToTypedObject(
     row: Row,
@@ -527,13 +553,12 @@ export class AthenaQueryResultParser {
     for (const [index, header] of headers.entries()) {
       const raw = row.Data?.[index]?.VarCharValue ?? null;
       const column = columnInfo[index];
-      obj[header] = convertTypedValue(
-        raw,
-        header,
-        column,
-        unparseable,
-        options.rowIndex,
-      );
+      obj[header] = convertTypedValue(raw, header, column, {
+        unparseableValueBehavior: unparseable,
+        rowIndex: options.rowIndex,
+        timeZone: options.timeZone,
+        dateValue: options.dateValue ?? DEFAULT_DATE_VALUE,
+      });
     }
 
     if (behavior === 'extra' && actual > expected) {
